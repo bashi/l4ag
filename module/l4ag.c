@@ -55,6 +55,8 @@ struct l4ag_struct {
     struct socket *send_sock;
     struct task_struct *recv_thread;
     struct task_struct *accept_thread;
+    char recvbuf[8192]; // XXX should be variable length
+    int recvlen;
 };
 
 static unsigned int l4ag_net_id;
@@ -158,7 +160,7 @@ static void l4ag_net_init(struct net_device *dev)
     /* Acts as L3 Point-to-Point device */
     dev->hard_header_len = 0;
     dev->addr_len = 0;
-    dev->mtu = 1440;
+    dev->mtu = 1500;
     dev->change_mtu = l4ag_net_change_mtu;
     dev->type = ARPHRD_NONE;
     dev->flags = IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
@@ -260,62 +262,66 @@ static int l4ag_setrtpriority(struct task_struct *th)
     return sched_setscheduler(th, SCHED_FIFO, &param);
 }
 
-/* Receive thread */
-static int l4ag_recvmsg_thread(void *arg)
+/* Decapsulate packets */
+/* ToDo: support IPv6 */
+static int l4ag_receive(struct l4ag_struct *ln)
 {
-    struct l4ag_struct *ln = (struct l4ag_struct *)arg;
     struct sk_buff *skb;
+    char *data;
     __be16 proto;
-    int len, err = 0;
-    char buf[4096];
+    int pktlen, len = 0;
+    struct iphdr *iph;
 
-    if (!ln->recv_sock)
-        return -EINVAL;
+    len = l4ag_recvsock(ln->recv_sock, ln->recvbuf + ln->recvlen,
+                        sizeof(ln->recvbuf) - ln->recvlen, 0);
+    if (len == 0)
+        return 0;
+    if (len < 0) {
+        printk(KERN_INFO "kernel_recvmsg failed with code %d.", len);
+        /* XXX should discard socket here ? */
+        return len;
+    }
 
-    DBG(KERN_INFO "l4ag: receiver thread started.\n");
-    while (true) {
+    data = ln->recvbuf;
+    ln->recvlen += len;
+    while (ln->recvlen > 0) {
         skb = NULL;
-        len = l4ag_recvsock(ln->recv_sock, buf, sizeof(buf), 0);
+        DBG(KERN_INFO "l4ag: buf: %x %x %x %x\n", data[0],
+            data[1], data[2], data[3]);
 
-        if (len == 0)
-            goto out;
-
-        if (len < 0) {
-            printk(KERN_INFO "kernel_recvmsg failed with code %d.", len);
-            /* XXX should discard socket here ? */
-            err = len;
-            goto out;
-        }
-
-        DBG(KERN_INFO "l4ag: iov: %x %x %x %x\n", buf[0],
-            buf[1], buf[2], buf[3]);
-
-        if (!(skb = alloc_skb(len, GFP_KERNEL))) {
-            ln->dev->stats.rx_dropped++;
-            err = -ENOMEM;
-            goto out;
-        }
-
-        skb_copy_to_linear_data(skb, buf, len);
-        skb_put(skb, len);
-
-        DBG(KERN_INFO "l4ag: skb: %x %x %x %x\n", skb->data[0],
-            skb->data[1], skb->data[2], skb->data[3]);
-        DBG(KERN_INFO "l4ag: skb->len: %d\n", skb->len);
-
-        skb->ip_summed = CHECKSUM_UNNECESSARY;
-        switch (skb->data[0] & 0xf0) {
+        switch (data[0] & 0xf0) {
         case 0x40:
+            iph = (struct iphdr *)data;
             proto = htons(ETH_P_IP);
             break;
         case 0x60:
-            proto = htons(ETH_P_IPV6);
-            break;
+            //proto = htons(ETH_P_IPV6);
+            ln->recvlen = 0;
+            return -EINVAL;
         default:
-            err = -EINVAL;
             DBG(KERN_INFO "l4ag: could not determine protocol.\n");
-            goto out_free;
+            ln->recvlen = 0;
+            return -EINVAL;
         }
+
+        if (ln->recvlen < sizeof(*iph))
+            goto out_partial;
+
+        pktlen = ntohs(iph->tot_len);
+        if (pktlen > ln->recvlen) 
+            goto out_partial;
+
+        DBG(KERN_INFO "l4ag: pktlen = %d\n", pktlen);
+
+        if (!(skb = alloc_skb(pktlen, GFP_KERNEL))) {
+            ln->dev->stats.rx_dropped++;
+            ln->recvlen = 0;
+            return -ENOMEM;
+        }
+
+        skb_copy_to_linear_data(skb, data, pktlen);
+        skb_put(skb, pktlen);
+        skb->ip_summed = CHECKSUM_UNNECESSARY;
         skb_reset_mac_header(skb);
         skb->protocol = proto;
         skb->dev = ln->dev;
@@ -324,11 +330,37 @@ static int l4ag_recvmsg_thread(void *arg)
 
         ln->dev->last_rx = jiffies;
         ln->dev->stats.rx_packets++;
-        ln->dev->stats.rx_bytes += len;
+        ln->dev->stats.rx_bytes += pktlen;
+
+        ln->recvlen -= pktlen;
+        data += pktlen;
     }
-out_free:
-    kfree_skb(skb);
-out:
+
+    return 0;
+
+out_partial:
+    /* partial packet */
+    printk(KERN_DEBUG "l4ag: partial received, pull up.\n");
+    memmove(ln->recvbuf, data, ln->recvlen);
+    return 0;
+}
+
+/* Receive thread */
+static int l4ag_recvmsg_thread(void *arg)
+{
+    struct l4ag_struct *ln = (struct l4ag_struct *)arg;
+    int err = 0;
+
+    if (!ln->recv_sock)
+        return -EINVAL;
+
+    DBG(KERN_INFO "l4ag: receiver thread started.\n");
+    while (true) {
+        err = l4ag_receive(ln);
+        if (err)
+            break;
+    }
+
     DBG(KERN_INFO "l4ag: receiver thread stopped.\n");
     if (ln->recv_sock) {
         DBG(KERN_INFO "l4ag: shutdown recv socket.\n");
@@ -435,6 +467,8 @@ static int l4ag_create_device(struct net *net, struct file *file,
     ln->recv_sock = NULL;
     ln->accept_sock = NULL;
     ln->recv_thread = NULL;
+    memset(ln->recvbuf, 0, sizeof(ln->recvbuf));
+    ln->recvlen = 0;
 
     l4ag_start_kthread(&ln->accept_thread, l4ag_accept_thread, ln, "kl4agac");
     if (ln->accept_thread == ERR_PTR(-ENOMEM)) {
