@@ -163,7 +163,7 @@ static void l4ag_net_init(struct net_device *dev)
     dev->change_mtu = l4ag_net_change_mtu;
     dev->type = ARPHRD_NONE;
     dev->flags = IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
-    dev->tx_queue_len = 500;    // XXX
+    dev->tx_queue_len = 300;    // XXX
 }
 
 /*
@@ -325,9 +325,9 @@ out_free:
 out:
     DBG(KERN_INFO "l4ag: receiver thread stopped.\n");
     if (ln->recv_sock) {
-        DBG(KERN_INFO "l4ag: should shutdown recv socket.\n");
-        //kernel_sock_shutdown(ln->recv_sock, SHUT_WR);
-        //sock_release(ln->recv_sock);
+        DBG(KERN_INFO "l4ag: shutdown recv socket.\n");
+        kernel_sock_shutdown(ln->recv_sock, SHUT_RDWR);
+        sock_release(ln->recv_sock);
         ln->recv_sock = NULL;
     }
     ln->recv_thread = NULL;
@@ -355,12 +355,14 @@ static int l4ag_accept_thread(void *arg)
     err = kernel_accept(ln->accept_sock, &ln->recv_sock, 0);
     if (err < 0) {
         printk(KERN_INFO "l4ag: failed to accept socket, shutting down.\n");
-        goto out;
+        goto release_out;
     }
 
     l4ag_start_kthread(&ln->recv_thread, l4ag_recvmsg_thread, ln, "kl4agrx");
-    if (ln->recv_thread == ERR_PTR(-ENOMEM))
+    if (ln->recv_thread == ERR_PTR(-ENOMEM)) {
         err = -ENOMEM;
+        goto release_out;
+    }
 
     kernel_sock_shutdown(ln->accept_sock, SHUT_WR);
     sock_release(ln->accept_sock);
@@ -373,6 +375,14 @@ static int l4ag_accept_thread(void *arg)
     }
 
 out:
+    ln->accept_sock = NULL;
+    ln->accept_thread = NULL;
+
+    return err;
+
+release_out:
+    kernel_sock_shutdown(ln->accept_sock, SHUT_RDWR);
+    sock_release(ln->accept_sock);
     ln->accept_sock = NULL;
     ln->accept_thread = NULL;
     return err;
@@ -463,21 +473,23 @@ static int l4ag_delete_device(struct net *net, struct file *file,
     if (!ln)
         return -EINVAL;
 
-    /* Shutdown sockets */
+    /*
+     * Shutdown sockets.
+     * This will stop accept/recv thread.
+     * sock_release() will call when these threads stopped.
+     */
     if (ln->accept_sock) {
-        kernel_sock_shutdown(ln->accept_sock, SHUT_WR);
-        //sock_release(ln->accept_sock);
-        ln->accept_sock = NULL;
+        DBG(KERN_INFO "l4ag: shutting down acceptsock...\n");
+        kernel_sock_shutdown(ln->accept_sock, SHUT_RDWR | SEND_SHUTDOWN);
     }
-    if (ln->recv_sock) {
+    /* XXX recv_sock shoud not shutdown here when accept socket available. */
+    if (!ln->accept_sock && ln->recv_sock) {
+        DBG(KERN_INFO "l4ag: shutting down recvsock...\n");
         kernel_sock_shutdown(ln->recv_sock, SHUT_RDWR | SEND_SHUTDOWN);
-        tcp_close(ln->recv_sock->sk, 0);
-        sock_release(ln->recv_sock);
-        ln->recv_sock = NULL;
     }
     if (ln->send_sock) {
+        DBG(KERN_INFO "l4ag: shutting down sendsock...\n");
         kernel_sock_shutdown(ln->send_sock, SHUT_RDWR | SEND_SHUTDOWN);
-        tcp_close(ln->send_sock->sk, 0);
         sock_release(ln->send_sock);
         ln->send_sock = NULL;
     }
