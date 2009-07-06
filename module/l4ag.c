@@ -7,6 +7,7 @@
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/kthread.h>
+#include <linux/sched.h>
 #include <linux/major.h>
 #include <linux/smp_lock.h>
 #include <linux/poll.h>
@@ -252,6 +253,13 @@ out:
     *th; \
 })
 
+/* Set thread priority to RT */
+static int l4ag_setrtpriority(struct task_struct *th)
+{
+    struct sched_param param = { .sched_priority = MAX_RT_PRIO - 1 };
+    return sched_setscheduler(th, SCHED_FIFO, &param);
+}
+
 /* Receive thread */
 static int l4ag_recvmsg_thread(void *arg)
 {
@@ -361,6 +369,9 @@ static int l4ag_accept_thread(void *arg)
         err = -ENOMEM;
         goto release_out;
     }
+    err = l4ag_setrtpriority(ln->recv_thread);
+    if (err)
+        DBG(KERN_INFO "l4ag: couldn't set priority.\n");
 
     kernel_sock_shutdown(ln->accept_sock, SHUT_WR);
     sock_release(ln->accept_sock);
