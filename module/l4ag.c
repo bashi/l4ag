@@ -35,6 +35,9 @@
 
 static int debug = 1;
 
+/* uncomment this to debug. */
+//#define DEBUG 1
+
 #ifdef DEBUG
 # define DBG if(debug)printk
 #else
@@ -803,7 +806,7 @@ static int __init l4ag_init(void)
 {
     int err;
 
-    printk(KERN_INFO "l4ag: %s, %s\n", DRV_DESCRIPTION, DRV_VERSION);
+    printk(KERN_INFO "l4ag: %s, version %s\n", DRV_DESCRIPTION, DRV_VERSION);
 
     err = register_pernet_gen_device(&l4ag_net_id, &l4ag_net_ops);
     if (err) {
