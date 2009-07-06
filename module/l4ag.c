@@ -343,7 +343,7 @@ static int l4ag_receive(struct l4ag_struct *ln)
 
 out_partial:
     /* partial packet */
-    printk(KERN_DEBUG "l4ag: partial received, pull up.\n");
+    DBG(KERN_DEBUG "l4ag: partial received, pull up.\n");
     memmove(ln->recvbuf, data, ln->recvlen);
     return 0;
 }
