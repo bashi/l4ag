@@ -32,8 +32,6 @@
 #define DRV_DESCRIPTION "Layer 4 aggregation driver"
 #define DRV_COPYRIGHT "(C) 2009 Kenichi Ishibashi <kenich-i@is.naist.jp>"
 
-#define DEBUG 1
-
 static int debug = 1;
 
 #ifdef DEBUG
