@@ -368,9 +368,12 @@ static int l4ag_accept_thread(void *arg)
 
     err = kernel_setsockopt(ln->recv_sock, IPPROTO_TCP, TCP_LINGER2,
                             (char*)&on, sizeof(int));
-    if (err < 0) {
+    if (err < 0)
         DBG(KERN_INFO "l4ag: failed to set TCP_LINGER2 option.\n");
-    }
+    err = kernel_setsockopt(ln->recv_sock, IPPROTO_TCP, TCP_NODELAY,
+                            (char*)&on, sizeof(int));
+    if (err < 0)
+        DBG(KERN_INFO "l4ag: failed to set TCP_NODELAY option.\n");
 
 out:
     ln->accept_sock = NULL;
@@ -534,6 +537,13 @@ static int l4ag_create_sendsock(struct net *net, struct file *file,
 
     err = kernel_setsockopt(ln->send_sock, IPPROTO_TCP, TCP_LINGER2,
                             (char*)&on, sizeof(int));
+    if (err < 0)
+        DBG(KERN_INFO "l4ag: failed to set TCP_LINGER2 option.\n");
+    err = kernel_setsockopt(ln->send_sock, IPPROTO_TCP, TCP_NODELAY,
+                            (char*)&on, sizeof(int));
+    if (err < 0)
+        DBG(KERN_INFO "l4ag: failed to set TCP_NODELAY option.\n");
+
     err = kernel_connect(ln->send_sock, &ifr->ifr_addr, sizeof(struct sockaddr), 0);
     if (err) {
         printk(KERN_INFO "l4ag: failed to connect the server.\n");
