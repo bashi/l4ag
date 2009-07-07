@@ -8,6 +8,7 @@
 #include <linux/kernel.h>
 #include <linux/kthread.h>
 #include <linux/sched.h>
+#include <linux/completion.h>
 #include <linux/major.h>
 #include <linux/smp_lock.h>
 #include <linux/poll.h>
@@ -48,16 +49,17 @@ static int debug = 1;
 struct l4ag_struct {
     struct list_head list;
     unsigned int flags;
-    wait_queue_head_t read_wait;
-    struct sk_buff_head readq;
+    struct completion sendq_comp;
+    struct sk_buff_head sendq;
     struct net_device *dev;
     struct fasync_struct *fasync;
     int portnum;
     struct socket *accept_sock;
     struct socket *recv_sock;
     struct socket *send_sock;
-    struct task_struct *recv_thread;
     struct task_struct *accept_thread;
+    struct task_struct *recv_thread;
+    struct task_struct *send_thread;
     char recvbuf[8192]; // XXX should be variable length
     int recvlen;
 };
@@ -112,37 +114,27 @@ static int l4ag_net_close(struct net_device *dev)
 static int l4ag_net_xmit(struct sk_buff *skb, struct net_device *dev)
 {
     struct l4ag_struct *ln = netdev_priv(dev);
-    int len = 0;
 
-    if (!ln->send_sock)
+    if (!ln->send_thread)
         return -EINVAL;
 
+    if (skb_queue_len(&ln->sendq) >= dev->tx_queue_len) {
+        DBG(KERN_INFO "l4ag: too many send packets, drop.\n");
+        goto drop;
+    }
+
+    /* Enqueue packet */
+    skb_queue_tail(&ln->sendq, skb);
     dev->trans_start = jiffies;
 
-    /* XXX should prepare buffer ? */
-    len = l4ag_sendsock(ln->send_sock, skb->data, skb->len,
-                        MSG_NOSIGNAL | MSG_DONTWAIT);
-    DBG(KERN_INFO "l4ag: sending message, len = %d\n", len);
-
-    if (len < 0) {
-        printk(KERN_INFO "l4ag: failed to send message, code = %d\n", len);
-        goto drop;
-    }
-
-    if (len != skb->len) {
-        printk(KERN_INFO "l4ag: sendmsg length mismatch, req = %d, result = %d\n", skb->len, len);
-        goto drop;
-    }
-
-    ln->dev->stats.tx_packets++;
-    ln->dev->stats.tx_bytes += len;
-    kfree_skb(skb);
-
+    /* Wakeup send thread */
+    complete(&ln->sendq_comp);
     return 0;
+
 drop:
+    dev->stats.tx_dropped++;
     kfree_skb(skb);
-    dev->stats.tx_fifo_errors++;
-    return -ENOMEM;
+    return 0;
 }
 
 #define L4AG_MIN_MTU 68
@@ -167,7 +159,7 @@ static void l4ag_net_init(struct net_device *dev)
     dev->change_mtu = l4ag_net_change_mtu;
     dev->type = ARPHRD_NONE;
     dev->flags = IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
-    dev->tx_queue_len = 300;    // XXX
+    dev->tx_queue_len = 300;
 }
 
 /*
@@ -188,9 +180,6 @@ static ssize_t l4ag_fops_aio_read(struct kiocb *iocb, const struct iovec *iv,
 
 static void l4ag_setup(struct net_device *dev)
 {
-    struct l4ag_struct *ln = netdev_priv(dev);
-    skb_queue_head_init(&ln->readq);
-    init_waitqueue_head(&ln->read_wait);
     dev->open = l4ag_net_open;
     dev->hard_start_xmit = l4ag_net_xmit;
     dev->stop = l4ag_net_close;
@@ -435,6 +424,57 @@ release_out:
     return err;
 }
 
+/* Sender thread */
+static int l4ag_send_thread(void *arg)
+{
+    struct l4ag_struct *ln = (struct l4ag_struct *)arg;
+    struct sk_buff *skb;
+    int err, len;
+
+    DBG(KERN_INFO "l4ag: sender thread started.\n");
+
+    while (true) {
+        err = wait_for_completion_interruptible(&ln->sendq_comp);
+
+        if (err || !ln->send_sock)
+            break;
+
+        while ((skb = skb_dequeue(&ln->sendq))) {
+retry:
+            len = l4ag_sendsock(ln->send_sock, skb->data, skb->len, 0);
+            if (len < 0) {
+                printk(KERN_INFO "l4ag: failed to send message, code = %d\n", len);
+                goto drop;
+            }
+            if (len != skb->len) {
+                DBG(KERN_INFO "l4ag: sendmsg length mismatch, req = %d, result = %d\n", skb->len, len);
+                skb_pull(skb, len);
+                goto retry;
+            }
+            ln->dev->stats.tx_packets++;
+            ln->dev->stats.tx_bytes += len;
+            kfree_skb(skb);
+        }
+        INIT_COMPLETION(ln->sendq_comp);
+    }
+
+    DBG(KERN_INFO "l4ag: sender thread stopped.\n");
+    skb_queue_purge(&ln->sendq);
+    if (ln->send_sock) {
+        DBG(KERN_INFO "l4ag: shutdown send socket.\n");
+        kernel_sock_shutdown(ln->send_sock, SHUT_RDWR);
+        sock_release(ln->send_sock);
+        ln->send_sock = NULL;
+    }
+    ln->send_thread = NULL;
+    return err;
+
+drop:
+    kfree_skb(skb);
+    skb_queue_purge(&ln->sendq);
+    return -ENOMEM;
+}
+
 static int l4ag_create_device(struct net *net, struct file *file,
                               struct ifreq *ifr)
 {
@@ -470,8 +510,11 @@ static int l4ag_create_device(struct net *net, struct file *file,
     ln->recv_sock = NULL;
     ln->accept_sock = NULL;
     ln->recv_thread = NULL;
+    ln->send_thread = NULL;
     memset(ln->recvbuf, 0, sizeof(ln->recvbuf));
     ln->recvlen = 0;
+    skb_queue_head_init(&ln->sendq);
+    init_completion(&ln->sendq_comp);
 
     l4ag_start_kthread(&ln->accept_thread, l4ag_accept_thread, ln, "kl4agac");
     if (ln->accept_thread == ERR_PTR(-ENOMEM)) {
@@ -557,7 +600,7 @@ static int l4ag_delete_device(struct net *net, struct file *file,
     put_net(dev_net(ln->dev));
 
     /* Drop read queue */
-    skb_queue_purge(&ln->readq);
+    skb_queue_purge(&ln->sendq);
 
     list_del(&ln->list);
     unregister_netdevice(ln->dev);
@@ -597,6 +640,15 @@ static int l4ag_create_sendsock(struct net *net, struct file *file,
         printk(KERN_INFO "l4ag: failed to connect the server.\n");
         sock_release(ln->send_sock);
         goto out;
+    }
+
+    /* Start sender thread. */
+    DBG(KERN_INFO "l4ag: starting sender thread.\n");
+    l4ag_start_kthread(&ln->send_thread, l4ag_send_thread, ln, "kl4agtx");
+    if (ln->send_thread == ERR_PTR(-ENOMEM)) {
+        DBG(KERN_INFO "l4ag: failed to start kthread.\n");
+        err = -ENOMEM;
+        sock_release(ln->send_sock);
     }
 
 out:
@@ -675,7 +727,7 @@ static int l4ag_fops_close(struct inode *inode, struct file *file)
 
     if (!(ln->flags & L4AG_PERSIST)) {
         /* Drop read queue */
-        skb_queue_purge(&ln->readq);
+        skb_queue_purge(&ln->sendq);
 
         list_del(&ln->list);
         unregister_netdevice(ln->dev);
