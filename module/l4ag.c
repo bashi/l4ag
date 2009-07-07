@@ -662,7 +662,7 @@ static int l4ag_fops_ioctl(struct inode *inode, struct file *file,
     struct ifreq ifr;
     int err;
 
-    if (cmd == L4AGIOCCREATE || cmd == L4AGIOCDELETE || cmd == L4AGIOCSENDADDR)
+    if (cmd == L4AGIOCCREATE || cmd == L4AGIOCDELETE || cmd == L4AGIOCPEER)
         if (copy_from_user(&ifr, argp, sizeof(ifr)))
             return -EFAULT;
 
@@ -688,7 +688,7 @@ static int l4ag_fops_ioctl(struct inode *inode, struct file *file,
         return 0;
     }
 
-    if (cmd == L4AGIOCSENDADDR) {
+    if (cmd == L4AGIOCPEER) {
         ifr.ifr_name[IFNAMSIZ-1] = '\0';
         rtnl_lock();
         err = l4ag_create_sendsock(current->nsproxy->net_ns, file, &ifr);

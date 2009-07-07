@@ -21,7 +21,7 @@ void usage() {
         "usage:",
         "  l4ag-config create [-p <portnum>] [<ifname>]",
         "  l4ag-config delete <ifname>",
-        "  l4ag-config sendaddr <ifname> <addr> [<portnum>]",
+        "  l4ag-config peer <ifname> <addr> [<portnum>]",
         NULL
     };
     char **p = lines;
@@ -82,7 +82,7 @@ int delete_device(int argc, char **argv)
     return do_ioctl(L4AGIOCDELETE, &ifr);
 }
 
-int set_sendaddr(int argc, char **argv)
+int set_peer(int argc, char **argv)
 {
     struct ifreq ifr;
     struct sockaddr_in *addr;
@@ -108,14 +108,14 @@ int set_sendaddr(int argc, char **argv)
     addr = (struct sockaddr_in *)&ifr.ifr_addr;
     /* XXX assume first addrinfo is the best information */
     memcpy(addr, res->ai_addr, res->ai_addrlen);
-    printf("set sendaddr: %s\n", inet_ntoa(addr->sin_addr));
+    printf("set peer, addr: %s\n", inet_ntoa(addr->sin_addr));
     if (argc > 2) {
         addr->sin_port = htons(atoi(argv[2]));
     } else {
         addr->sin_port = htons(L4AG_DEFAULTPORT);
     }
     freeaddrinfo(res);
-    return do_ioctl(L4AGIOCSENDADDR, &ifr);
+    return do_ioctl(L4AGIOCPEER, &ifr);
 }
 
 struct l4ag_operations {
@@ -124,7 +124,7 @@ struct l4ag_operations {
 } l4ag_ops[] = {
     { "create", create_device },
     { "delete", delete_device },
-    { "sendaddr", set_sendaddr },
+    { "peer", set_peer },
     { NULL, NULL }
 };
 

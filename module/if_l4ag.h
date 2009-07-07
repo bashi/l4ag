@@ -12,7 +12,7 @@
 /* Ioctl defines */
 #define L4AGIOCCREATE _IOW('L', 160, int)
 #define L4AGIOCDELETE _IOW('L', 161, int)
-#define L4AGIOCSENDADDR _IOW('L', 162, int)
+#define L4AGIOCPEER _IOW('L', 162, int)
 #define L4AGIOCSDEBUG _IOW('L', 170, int)
 
 /* Default variables */
