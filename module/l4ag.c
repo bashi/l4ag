@@ -328,13 +328,13 @@ static int l4ag_receive(struct l4ag_struct *ln)
         data += pktlen;
     }
 
-    return 0;
+    return len;
 
 out_partial:
     /* partial packet */
     DBG(KERN_DEBUG "l4ag: partial received, pull up.\n");
     memmove(ln->recvbuf, data, ln->recvlen);
-    return 0;
+    return len;
 }
 
 /* Receive thread */
@@ -349,7 +349,7 @@ static int l4ag_recvmsg_thread(void *arg)
     DBG(KERN_INFO "l4ag: receiver thread started.\n");
     while (true) {
         err = l4ag_receive(ln);
-        if (err)
+        if (err <= 0)
             break;
     }
 
