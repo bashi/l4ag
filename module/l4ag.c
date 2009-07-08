@@ -650,7 +650,9 @@ static int l4ag_create_sendsock(struct net *net, struct file *file,
         err = -ENOMEM;
         sock_release(ln->send_sock);
     }
-
+    err = l4ag_setrtpriority(ln->send_thread);
+    if (err)
+        DBG(KERN_INFO "l4ag: couldn't set priority.\n");
 out:
     return err;
 }
