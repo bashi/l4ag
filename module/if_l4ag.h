@@ -5,7 +5,7 @@
 #include <linux/socket.h>
 
 /* l4ag device flags */
-#define L4AG_FASYNC     0x0010
+#define L4AG_RUNNING    0x0010
 #define L4AG_PERSIST    0x0100
 #define L4AG_DEBUG      0x1000
 
