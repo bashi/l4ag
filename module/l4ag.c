@@ -46,39 +46,6 @@ static int debug = 1;
 # define DBG( a... )
 #endif
 
-/* device specific data */
-struct l4ag_struct;
-
-#define L4CONN_ACTIVEOPEN   0x0001
-#define L4CONN_PASSIVEOPEN  0x0002
-#define L4CONN_RECVACTIVE   0x0004
-#define L4CONN_SENDACTIVE   0x0008
-#define L4CONN_ACTIVE (L4CONN_RECVACTIVE | L4CONN_SENDACTIVE)
-
-struct l4conn {
-    struct list_head list;
-    struct l4ag_struct *l4st;
-    int flags;
-    int recvlen;
-    char recvbuf[8192]; // XXX length should be variable
-    struct socket *recv_sock;
-    struct task_struct *recv_thread;
-    struct socket *send_sock;   // XXX should separate?
-};
-
-struct l4ag_struct {
-    struct list_head list;
-    unsigned int flags;
-    struct completion sendq_comp;
-    struct sk_buff_head sendq;
-    struct net_device *dev;
-    int portnum;
-    struct socket *accept_sock;
-    struct task_struct *accept_thread;
-    struct task_struct *send_thread;
-    struct list_head l4conn_list;
-};
-
 static unsigned int l4ag_net_id;
 struct l4ag_net {
     struct list_head dev_list;
@@ -372,6 +339,43 @@ static int l4ag_recvpacket_generic(struct l4ag_struct *ln, __be16 proto,
     return 0;
 }
 
+static int l4ag_sendpacket_generic(struct l4ag_struct *ln)
+{
+    struct sk_buff *skb;
+    struct l4conn *lc;
+    int len;
+
+    /* XXX currently use first send_sock */
+    lc = list_first_entry(&ln->l4conn_list, struct l4conn, list);
+    if (!(lc->flags & L4CONN_SENDACTIVE)) {
+        DBG(KERN_INFO "l4ag: there is no send socket.\n");
+        return -EINVAL;
+    }
+    
+    while ((skb = skb_dequeue(&ln->sendq))) {
+retry:
+        len = l4ag_sendsock(lc->send_sock, skb->data, skb->len, 0);
+        if (len < 0) {
+            printk(KERN_INFO "l4ag: failed to send message, code = %d\n", len);
+            return len;
+        }
+        if (len != skb->len) {
+            DBG(KERN_INFO "l4ag: sendmsg length mismatch, req = %d, result = %d\n", skb->len, len);
+            skb_pull(skb, len);
+            goto retry;
+        }
+        ln->dev->stats.tx_packets++;
+        ln->dev->stats.tx_bytes += len;
+        kfree_skb(skb);
+    }
+    return 0;
+}
+
+static struct l4ag_operations l4ag_generic_ops = {
+    .recvpacket = l4ag_recvpacket_generic,
+    .sendpacket = l4ag_sendpacket_generic
+};
+
 /* Decapsulate packets */
 /* ToDo: support IPv6 */
 static int l4conn_receive(struct l4conn *lc)
@@ -421,7 +425,7 @@ static int l4conn_receive(struct l4conn *lc)
 
         DBG(KERN_INFO "l4ag: pktlen = %d\n", pktlen);
 
-        err = l4ag_recvpacket_generic(lc->l4st, proto, data, pktlen);
+        err = lc->l4st->ops->recvpacket(lc->l4st, proto, data, pktlen);
         if (err < 0) {
             lc->recvlen = 0;
             break;
@@ -472,9 +476,7 @@ static int l4conn_recvthread(void *arg)
 static int l4ag_sendthread_generic(void *arg)
 {
     struct l4ag_struct *ln = (struct l4ag_struct *)arg;
-    struct l4conn *lc;
-    struct sk_buff *skb;
-    int err, len;
+    int err;
 
     DBG(KERN_INFO "l4ag: sender thread started.\n");
 
@@ -483,33 +485,15 @@ static int l4ag_sendthread_generic(void *arg)
         if (err || !(ln->flags & L4AG_RUNNING))
             break;
 
-        /* XXX currently use first send_sock */
         if (list_empty(&ln->l4conn_list)) {
             DBG(KERN_INFO "l4ag: there is no l4 connection.\n");
             goto drop;
         }
-        lc = list_first_entry(&ln->l4conn_list, struct l4conn, list);
-        if (!(lc->flags & L4CONN_SENDACTIVE)) {
-            DBG(KERN_INFO "l4ag: there is no send socket.\n");
-            goto drop;
-        }
 
-        while ((skb = skb_dequeue(&ln->sendq))) {
-retry:
-            len = l4ag_sendsock(lc->send_sock, skb->data, skb->len, 0);
-            if (len < 0) {
-                printk(KERN_INFO "l4ag: failed to send message, code = %d\n", len);
-                goto drop;
-            }
-            if (len != skb->len) {
-                DBG(KERN_INFO "l4ag: sendmsg length mismatch, req = %d, result = %d\n", skb->len, len);
-                skb_pull(skb, len);
-                goto retry;
-            }
-            ln->dev->stats.tx_packets++;
-            ln->dev->stats.tx_bytes += len;
-            kfree_skb(skb);
-        }
+        err = ln->ops->sendpacket(ln);
+        if (err < 0)
+            goto drop;
+
         INIT_COMPLETION(ln->sendq_comp);
         continue;
 drop:
@@ -687,6 +671,7 @@ static int l4ag_create_device(struct net *net, struct file *file,
     skb_queue_head_init(&ln->sendq);
     init_completion(&ln->sendq_comp);
     INIT_LIST_HEAD(&ln->l4conn_list);
+    ln->ops = &l4ag_generic_ops;
 
     /* Start accept thread */
     l4ag_start_kthread(&ln->accept_thread, l4ag_accept_thread, ln, "kl4agac");
