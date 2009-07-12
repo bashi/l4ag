@@ -53,14 +53,29 @@ struct l4ag_net {
 
 static const struct ethtool_ops l4ag_ethtool_ops;
 
-static void l4ag_sockaddr_dbgprint(struct sockaddr *addr)
+static void l4ag_sockaddr_dbgprint(char *prefix, struct sockaddr *addr)
 {
     __u32 haddr = ntohl(((struct sockaddr_in*)addr)->sin_addr.s_addr);
     __u16 hport = ntohs(((struct sockaddr_in*)addr)->sin_port);
 
-    printk(KERN_INFO "l4ag: addr: %d.%d.%d.%d:%d\n",
+    printk(KERN_INFO "%s%d.%d.%d.%d:%d\n", prefix,
            (haddr >> 24), ((haddr >> 16)&0xff), ((haddr >> 8)&0xff),
            (haddr & 0xff), hport);
+}
+
+static void l4ag_sock_dbgprint(struct socket *sock)
+{
+    struct sockaddr_in addr;
+    int err, addrlen = sizeof(addr);
+
+    err = kernel_getsockname(sock, (struct sockaddr*)&addr, &addrlen);
+    if (err < 0)
+        return;
+    l4ag_sockaddr_dbgprint("  local: ", (struct sockaddr*)&addr);
+    err = kernel_getpeername(sock, (struct sockaddr*)&addr, &addrlen);
+    if (err < 0)
+        return;
+    l4ag_sockaddr_dbgprint("  remote: ", (struct sockaddr*)&addr);
 }
 
 /* socket operations */
@@ -89,7 +104,9 @@ static int l4ag_sendsock(struct socket *sock, unsigned char *buf,
 /* Net device open. */
 static int l4ag_net_open(struct net_device *dev)
 {
+    struct l4ag_struct *ln = netdev_priv(dev);
     DBG(KERN_INFO "l4ag: net_open, start_queue\n");
+    ln->flags |= L4AG_RUNNING;
     netif_start_queue(dev);
     return 0;
 }
@@ -97,7 +114,9 @@ static int l4ag_net_open(struct net_device *dev)
 /* Net device close. */
 static int l4ag_net_close(struct net_device *dev)
 {
+    struct l4ag_struct *ln = netdev_priv(dev);
     DBG(KERN_INFO "l4ag: net_close, stop_queue\n");
+    ln->flags &= ~L4AG_RUNNING;
     netif_stop_queue(dev);
     return 0;
 }
@@ -147,7 +166,7 @@ static void l4ag_net_init(struct net_device *dev)
     /* Acts as L3 Point-to-Point device */
     dev->hard_header_len = 0;
     dev->addr_len = 0;
-    dev->mtu = 1500;
+    dev->mtu = 4096;
     dev->change_mtu = l4ag_net_change_mtu;
     dev->type = ARPHRD_NONE;
     dev->flags = IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
@@ -236,6 +255,7 @@ static struct l4conn *l4ag_create_l4conn(struct l4ag_struct *ln, int flags)
         return NULL;
     lc->l4st = ln;
     lc->flags = flags;
+    lc->pri = 0;
     lc->recvlen = 0;
     memset(lc->recvbuf, 0, sizeof(lc->recvbuf));
     lc->recv_sock = NULL;
@@ -253,11 +273,13 @@ static void l4ag_delete_l4conn(struct l4ag_struct *ln, struct l4conn *lc)
     /* close connection. */
     if (lc->recv_sock) {
         DBG(KERN_INFO "l4ag: shutting down recvsock...\n");
+        ln->ops->delete_recvsocket(ln, lc);
         kernel_sock_shutdown(lc->recv_sock, SHUT_RDWR);
         /* lc->recv_sock will set to NULL when recv thread terminates. */
     }
     if (lc->send_sock) {
         DBG(KERN_INFO "l4ag: shutting down sendsock...\n");
+        ln->ops->delete_sendsocket(ln, lc);
         kernel_sock_shutdown(lc->send_sock, SHUT_RDWR);
         sock_release(lc->send_sock);
         lc->send_sock = NULL;
@@ -277,15 +299,14 @@ static struct l4conn *l4ag_get_l4conn_by_peeraddr(struct l4ag_struct *ln,
     int err, addrlen;
 
     /* XXX should lock? */
-    DBG(KERN_INFO "searching peer.\n");
-    l4ag_sockaddr_dbgprint((struct sockaddr*)paddr);
+    l4ag_sockaddr_dbgprint("l4ag: searching peer: ", (struct sockaddr*)paddr);
     list_for_each_entry(lc, &ln->l4conn_list, list) {
         if (!lc->send_sock)
             continue;
         addrlen = sizeof(addr);
         err = kernel_getpeername(lc->send_sock, (struct sockaddr*)&addr,
                                  &addrlen);
-        l4ag_sockaddr_dbgprint((struct sockaddr*)&addr);
+        l4ag_sockaddr_dbgprint("addr: ", (struct sockaddr*)&addr);
         if (err < 0) {
             DBG(KERN_INFO "l4ag: couldn't get socket address.\n");
             continue;
@@ -315,88 +336,52 @@ static int l4ag_setrtpriority(struct task_struct *th)
     return sched_setscheduler(th, SCHED_FIFO, &param);
 }
 
-static int l4ag_recvpacket_generic(struct l4ag_struct *ln, __be16 proto,
-                                   char *data, int len)
+/* generic l4ag operations */
+int l4ag_init_generic(struct l4ag_struct *ln)
 {
-    struct sk_buff *skb;
-
-    if (!(skb = alloc_skb(len, GFP_KERNEL))) {
-        ln->dev->stats.rx_dropped++;
-        return -ENOMEM;
-    }
-    skb_copy_to_linear_data(skb, data, len);
-    skb_put(skb, len);
-    skb->ip_summed = CHECKSUM_UNNECESSARY;
-    skb_reset_mac_header(skb);
-    skb->protocol = proto;
-    skb->dev = ln->dev;
-
-    netif_rx_ni(skb);
-
-    ln->dev->last_rx = jiffies;
-    ln->dev->stats.rx_packets++;
-    ln->dev->stats.rx_bytes += len;
     return 0;
 }
+EXPORT_SYMBOL(l4ag_init_generic);
 
-static int l4ag_sendpacket_generic(struct l4ag_struct *ln)
+void l4ag_release_generic(struct l4ag_struct *ln)
+{
+    // Nothing to do.
+}
+EXPORT_SYMBOL(l4ag_release_generic);
+
+void l4ag_add_recvsocket_generic(struct l4ag_struct *ln, struct l4conn *lc)
+{
+    // Nothing to do.
+}
+EXPORT_SYMBOL(l4ag_add_recvsocket_generic);
+
+void l4ag_add_sendsocket_generic(struct l4ag_struct *ln, struct l4conn *lc)
+{
+    // Nothing to do.
+}
+EXPORT_SYMBOL(l4ag_add_sendsocket_generic);
+
+void l4ag_delete_recvsocket_generic(struct l4ag_struct *ln, struct l4conn *lc)
+{
+    // Nothing to do.
+}
+EXPORT_SYMBOL(l4ag_delete_recvsocket_generic);
+
+void l4ag_delete_sendsocket_generic(struct l4ag_struct *ln, struct l4conn *lc)
+{
+    // Nothing to do.
+}
+EXPORT_SYMBOL(l4ag_delete_sendsocket_generic);
+
+static int l4ag_recvpacket_generic(struct l4ag_struct *ln, struct l4conn *lc)
 {
     struct sk_buff *skb;
-    struct l4conn *lc;
-    int len;
-
-    /* XXX currently use first send_sock */
-    lc = list_first_entry(&ln->l4conn_list, struct l4conn, list);
-    if (!(lc->flags & L4CONN_SENDACTIVE)) {
-        DBG(KERN_INFO "l4ag: there is no send socket.\n");
-        return -EINVAL;
-    }
-    
-    while ((skb = skb_dequeue(&ln->sendq))) {
-retry:
-        len = l4ag_sendsock(lc->send_sock, skb->data, skb->len, 0);
-        if (len < 0) {
-            printk(KERN_INFO "l4ag: failed to send message, code = %d\n", len);
-            return len;
-        }
-        if (len != skb->len) {
-            DBG(KERN_INFO "l4ag: sendmsg length mismatch, req = %d, result = %d\n", skb->len, len);
-            skb_pull(skb, len);
-            goto retry;
-        }
-        ln->dev->stats.tx_packets++;
-        ln->dev->stats.tx_bytes += len;
-        kfree_skb(skb);
-    }
-    return 0;
-}
-
-static struct l4ag_operations l4ag_generic_ops = {
-    .recvpacket = l4ag_recvpacket_generic,
-    .sendpacket = l4ag_sendpacket_generic
-};
-
-/* Decapsulate packets */
-/* ToDo: support IPv6 */
-static int l4conn_receive(struct l4conn *lc)
-{
-    char *data;
-    __be16 proto;
     struct iphdr *iph;
-    int pktlen, len = 0, err;
-
-    len = l4ag_recvsock(lc->recv_sock, lc->recvbuf + lc->recvlen,
-                        sizeof(lc->recvbuf) - lc->recvlen, 0);
-    if (len == 0)
-        return 0;
-    if (len < 0) {
-        printk(KERN_INFO "kernel_recvmsg failed with code %d.", len);
-        /* XXX should discard socket here ? */
-        return len;
-    }
+    __be16 proto;
+    char *data;
+    int pktlen;
 
     data = lc->recvbuf;
-    lc->recvlen += len;
     while (lc->recvlen > 0) {
         DBG(KERN_INFO "l4ag: buf: %x %x %x %x\n", data[0],
             data[1], data[2], data[3]);
@@ -425,44 +410,256 @@ static int l4conn_receive(struct l4conn *lc)
 
         DBG(KERN_INFO "l4ag: pktlen = %d\n", pktlen);
 
-        err = lc->l4st->ops->recvpacket(lc->l4st, proto, data, pktlen);
-        if (err < 0) {
-            lc->recvlen = 0;
-            break;
+        if (!(skb = alloc_skb(pktlen, GFP_KERNEL))) {
+            ln->dev->stats.rx_dropped++;
+            return -ENOMEM;
         }
+
+        skb_copy_to_linear_data(skb, data, pktlen);
+        skb_put(skb, pktlen);
+        skb->ip_summed = CHECKSUM_UNNECESSARY;
+        skb_reset_mac_header(skb);
+        skb->protocol = proto;
+        skb->dev = ln->dev;
+
+        netif_rx_ni(skb);
+
+        ln->dev->last_rx = jiffies;
+        ln->dev->stats.rx_packets++;
+        ln->dev->stats.rx_bytes += pktlen;
 
         lc->recvlen -= pktlen;
         data += pktlen;
     }
 
-    return len;
+    return 0;
 
 out_partial:
     /* partial packet */
     DBG(KERN_DEBUG "l4ag: partial received, pull up.\n");
     memmove(lc->recvbuf, data, lc->recvlen);
-    return len;
+    return 0;
+}
+EXPORT_SYMBOL(l4ag_recvpacket_generic);
+
+int l4ag_sendpacket_generic(struct l4ag_struct *ln)
+{
+    struct sk_buff *skb;
+    struct l4conn *lc;
+    int len;
+
+    /* Use first send_sock */
+    lc = list_first_entry(&ln->l4conn_list, struct l4conn, list);
+    if (!(lc->flags & L4CONN_SENDACTIVE)) {
+        DBG(KERN_INFO "l4ag: there is no send socket.\n");
+        return -EINVAL;
+    }
+    
+    while ((skb = skb_dequeue(&ln->sendq))) {
+retry:
+        len = l4ag_sendsock(lc->send_sock, skb->data, skb->len, 0);
+        if (len < 0) {
+            printk(KERN_INFO "l4ag: failed to send message, code = %d\n", len);
+            return len;
+        }
+        if (len != skb->len) {
+            DBG(KERN_INFO "l4ag: sendmsg length mismatch, req = %d, result = %d\n", skb->len, len);
+            ln->dev->stats.tx_bytes += len;
+            skb_pull(skb, len);
+            goto retry;
+        }
+        ln->dev->stats.tx_packets++;
+        ln->dev->stats.tx_bytes += len;
+        kfree_skb(skb);
+    }
+    return 0;
+}
+EXPORT_SYMBOL(l4ag_sendpacket_generic);
+
+static struct l4ag_operations __attribute__((unused)) l4ag_generic_ops = {
+    .init = l4ag_init_generic,
+    .release = l4ag_release_generic,
+    .add_recvsocket = l4ag_add_recvsocket_generic,
+    .add_sendsocket = l4ag_add_sendsocket_generic,
+    .delete_recvsocket = l4ag_delete_recvsocket_generic,
+    .delete_sendsocket = l4ag_delete_sendsocket_generic,
+    .recvpacket = l4ag_recvpacket_generic,
+    .sendpacket = l4ag_sendpacket_generic,
+    .private_data = NULL
+};
+
+/* Active/Backup algoritm operations */
+
+struct l4ag_ab_info {
+    struct l4conn *primary_rlc;
+    struct l4conn *primary_tlc;
+};
+
+static int l4ag_init_ab(struct l4ag_struct *ln)
+{
+    struct l4ag_ab_info *abinfo;
+
+    abinfo = kmalloc(sizeof(*abinfo), GFP_KERNEL | GFP_ATOMIC);
+    if (!abinfo)
+        return -ENOMEM;
+    abinfo->primary_rlc = NULL;
+    abinfo->primary_tlc = NULL;
+    ln->ops->private_data = abinfo;
+    DBG(KERN_INFO "l4ag: active/backup operation initialized.\n");
+    return 0;
 }
 
+static void l4ag_release_ab(struct l4ag_struct *ln)
+{
+    struct l4ag_ab_info *abinfo = ln->ops->private_data;
+
+    if (abinfo)
+        kfree(abinfo);
+    DBG(KERN_INFO "l4ag: active/backup operation released.\n");
+}
+
+static void l4ag_add_recvsocket_ab(struct l4ag_struct *ln, struct l4conn *lc)
+{
+    struct l4ag_ab_info *abinfo;
+    abinfo = (struct l4ag_ab_info *)lc->l4st->ops->private_data;
+
+    if ((abinfo->primary_rlc == NULL) || (abinfo->primary_rlc->pri > lc->pri))
+        abinfo->primary_rlc = lc;
+}
+
+static void l4ag_add_sendsocket_ab(struct l4ag_struct *ln, struct l4conn *lc)
+{
+    struct l4ag_ab_info *abinfo;
+    abinfo = (struct l4ag_ab_info *)lc->l4st->ops->private_data;
+
+    if ((abinfo->primary_tlc == NULL) || (abinfo->primary_tlc->pri > lc->pri))
+        abinfo->primary_tlc = lc;
+}
+
+static void l4ag_delete_recvsocket_ab(struct l4ag_struct *ln, struct l4conn *lc)
+{
+    struct l4ag_ab_info *abinfo;
+    struct l4conn *ptr, *primary = NULL;
+
+    abinfo = (struct l4ag_ab_info *)lc->l4st->ops->private_data;
+
+    if (list_empty(&lc->l4st->l4conn_list)) {
+        abinfo->primary_rlc = NULL;
+        return;
+    }
+
+    /* should lock? */
+    list_for_each_entry(ptr, &lc->l4st->l4conn_list, list) {
+        if (primary == NULL || primary->pri > ptr->pri)
+            break;
+    }
+    abinfo->primary_rlc = primary;
+}
+
+static void l4ag_delete_sendsocket_ab(struct l4ag_struct *ln, struct l4conn *lc)
+{
+    struct l4ag_ab_info *abinfo;
+    struct l4conn *ptr, *primary = NULL;
+
+    abinfo = (struct l4ag_ab_info *)lc->l4st->ops->private_data;
+
+    if (list_empty(&lc->l4st->l4conn_list)) {
+        abinfo->primary_tlc = NULL;
+        return;
+    }
+
+    /* should lock? */
+    list_for_each_entry(ptr, &lc->l4st->l4conn_list, list) {
+        if (primary == NULL || primary->pri > ptr->pri)
+            break;
+    }
+    abinfo->primary_tlc = primary;
+}
+
+static int l4ag_recvpacket_ab(struct l4ag_struct *ln, struct l4conn *lc)
+{
+    /* Currently just use generic function */
+    return l4ag_recvpacket_generic(ln, lc);
+}
+
+static int l4ag_sendpacket_ab(struct l4ag_struct *ln)
+{
+    struct sk_buff *skb;
+    struct l4ag_ab_info *abinfo = ln->ops->private_data;
+    struct socket *send_sock = abinfo->primary_tlc->send_sock;
+    int len;
+
+    if (!(abinfo->primary_tlc->flags & L4CONN_SENDACTIVE)) {
+        DBG(KERN_INFO "l4ag: primary send_sock is not active.\n");
+        return -EINVAL;
+    }
+
+    DBG(KERN_INFO "l4ag: active/backup algorithm send\n");
+    l4ag_sock_dbgprint(send_sock);
+
+    while ((skb = skb_dequeue(&ln->sendq))) {
+retry:
+        len = l4ag_sendsock(send_sock, skb->data, skb->len, 0);
+        if (len < 0) {
+            printk(KERN_INFO "l4ag: failed to send message\n");
+            return len;
+        }
+        if (len != skb->len) {
+            ln->dev->stats.tx_bytes += len;
+            skb_pull(skb, len);
+            goto retry;
+        }
+        ln->dev->stats.tx_packets++;
+        ln->dev->stats.tx_bytes += len;
+        kfree_skb(skb);
+    }
+
+    return 0;
+}
+
+static struct l4ag_operations __attribute__((unused)) l4ag_ab_ops = {
+    .init = l4ag_init_ab,
+    .release = l4ag_release_ab,
+    .add_recvsocket = l4ag_add_recvsocket_ab,
+    .add_sendsocket = l4ag_add_sendsocket_ab,
+    .delete_recvsocket = l4ag_delete_recvsocket_ab,
+    .delete_sendsocket = l4ag_delete_sendsocket_ab,
+    .recvpacket = l4ag_recvpacket_ab,
+    .sendpacket = l4ag_sendpacket_ab,
+    .private_data = NULL
+};
+
 /* Receiver thread */
-static int l4conn_recvthread(void *arg)
+static int l4ag_recvthread(void *arg)
 {
     struct l4conn *lc = (struct l4conn *)arg;
-    int err = 0;
+    struct l4ag_struct *ln = lc->l4st;
+    int err = 0, len;
 
     if (!lc->recv_sock)
         return -EINVAL;
 
     DBG(KERN_INFO "l4ag: receiver thread started.\n");
     while (true) {
-        err = l4conn_receive(lc);
-        if (err <= 0)
+        len = l4ag_recvsock(lc->recv_sock, lc->recvbuf + lc->recvlen,
+                            sizeof(lc->recvbuf) - lc->recvlen, 0);
+        if (len == 0)
+            break;
+        if (len < 0) {
+            printk(KERN_INFO "kernel_recvmsg failed with code %d.", len);
+            err = len;
+            break;
+        }
+        lc->recvlen += len;
+        err = ln->ops->recvpacket(ln, lc);
+        if (err < 0)
             break;
     }
 
     DBG(KERN_INFO "l4ag: receiver thread stopped.\n");
     if (lc->recv_sock) {
         DBG(KERN_INFO "l4ag: shutdown recv socket.\n");
+        ln->ops->delete_recvsocket(ln, lc);
         kernel_sock_shutdown(lc->recv_sock, SHUT_RDWR);
         sock_release(lc->recv_sock);
         lc->recv_sock = NULL;
@@ -473,7 +670,7 @@ static int l4conn_recvthread(void *arg)
 }
 
 /* Sender thread */
-static int l4ag_sendthread_generic(void *arg)
+static int l4ag_sendthread(void *arg)
 {
     struct l4ag_struct *ln = (struct l4ag_struct *)arg;
     int err;
@@ -482,7 +679,7 @@ static int l4ag_sendthread_generic(void *arg)
 
     while (true) {
         err = wait_for_completion_interruptible(&ln->sendq_comp);
-        if (err || !(ln->flags & L4AG_RUNNING))
+        if (err || !(ln->flags & L4AG_UP))
             break;
 
         if (list_empty(&ln->l4conn_list)) {
@@ -544,6 +741,7 @@ static int l4conn_create_sendsock(struct l4conn *lc,
     }
 
     lc->flags |= L4CONN_SENDACTIVE;
+    lc->l4st->ops->add_sendsocket(lc->l4st, lc);
     DBG(KERN_INFO "l4ag: created send socket\n");
     return 0;
 }
@@ -552,7 +750,8 @@ static int l4conn_recvthread_run(struct l4conn *lc, struct socket *sock)
 {
     lc->recv_sock = sock;
     lc->flags |= L4CONN_RECVACTIVE;
-    l4ag_start_kthread(&lc->recv_thread, l4conn_recvthread, lc, "kl4agrx");
+    lc->l4st->ops->add_recvsocket(lc->l4st, lc);
+    l4ag_start_kthread(&lc->recv_thread, l4ag_recvthread, lc, "kl4agrx");
     if (lc->recv_thread == ERR_PTR(-ENOMEM)) {
         printk(KERN_INFO "l4ag: failed to start recv thread.\n");
         goto out_release;
@@ -560,6 +759,7 @@ static int l4conn_recvthread_run(struct l4conn *lc, struct socket *sock)
     l4ag_setrtpriority(lc->recv_thread);
     return 0;
 out_release:
+    lc->l4st->ops->delete_recvsocket(lc->l4st, lc);
     kernel_sock_shutdown(lc->recv_sock, SHUT_RDWR);
     sock_release(lc->recv_sock);
     lc->recv_sock = NULL;
@@ -590,7 +790,7 @@ static int l4ag_accept_thread(void *arg)
             printk(KERN_INFO "l4ag: failed to accept socket, shutting down.\n");
             goto out_release;;
         }
-
+        DBG(KERN_INFO "l4ag: accept.\n");
         /* Check whether active/passive connection establishment */
         addrlen = sizeof(addr);
         err = kernel_getpeername(recv_sock, (struct sockaddr*)&addr, &addrlen);
@@ -665,13 +865,17 @@ static int l4ag_create_device(struct net *net, struct file *file,
     dev_net_set(dev, net);
     ln = netdev_priv(dev);
     ln->dev = dev;
-    ln->flags = L4AG_RUNNING | L4AG_PERSIST;
+    ln->flags = L4AG_UP | L4AG_PERSIST;
     ln->portnum = (int)ifr->ifr_data;
     ln->send_thread = NULL;
     skb_queue_head_init(&ln->sendq);
     init_completion(&ln->sendq_comp);
     INIT_LIST_HEAD(&ln->l4conn_list);
     ln->ops = &l4ag_generic_ops;
+
+    err = ln->ops->init(ln);
+    if (err < 0)
+        goto err_free_dev;
 
     /* Start accept thread */
     l4ag_start_kthread(&ln->accept_thread, l4ag_accept_thread, ln, "kl4agac");
@@ -681,8 +885,7 @@ static int l4ag_create_device(struct net *net, struct file *file,
     }
 
     /* Start send thread, this might wrong place to do it..*/
-    l4ag_start_kthread(&ln->send_thread, l4ag_sendthread_generic,
-                       ln, "kl4agtx");
+    l4ag_start_kthread(&ln->send_thread, l4ag_sendthread, ln, "kl4agtx");
 
     l4ag_net_init(dev);
 
@@ -708,6 +911,7 @@ static int l4ag_create_device(struct net *net, struct file *file,
     return 0;
 
 err_free_dev:
+    ln->ops->release(ln);
     free_netdev(dev);
     return err;
 }
@@ -728,7 +932,8 @@ static int l4ag_delete_device(struct net *net, struct file *file,
     if (!ln)
         return -EINVAL;
 
-    ln->flags &= ~L4AG_RUNNING;
+    ln->flags &= ~(L4AG_RUNNING | L4AG_UP);
+    ln->ops->release(ln);
 
     /*
      * Shutdown sockets.
@@ -774,7 +979,7 @@ static int l4ag_connect_peer(struct net *net, struct file *file,
     lnet = net_generic(current->nsproxy->net_ns, l4ag_net_id);
     ln = l4ag_get_by_name(lnet, ifr->ifr_name);
     if (!ln)
-        err = -EINVAL;
+        return -EINVAL;
 
     /* active connection establishment. */
     DBG(KERN_INFO "l4ag: connection active open.\n");
@@ -797,6 +1002,61 @@ out:
     return err;
 }
 
+static int l4ag_set_priority(struct net *net, struct file *file,
+                             struct ifreq *ifr)
+{
+    struct l4ag_net *lnet;
+    struct l4ag_struct *ln;
+    struct l4conn *lc;
+
+    lnet = net_generic(current->nsproxy->net_ns, l4ag_net_id);
+    ln = l4ag_get_by_name(lnet, ifr->ifr_name);
+    if (!ln)
+        return -EINVAL;
+
+    /* XXX assume first l4conn as the target for now. */
+    if (list_empty(&ln->l4conn_list))
+        return -EINVAL;
+
+    lc = list_first_entry(&ln->l4conn_list, struct l4conn, list);
+    lc->pri = (int)ifr->ifr_data;
+    DBG(KERN_INFO "l4ag: set priority %d\n", lc->pri);
+    l4ag_sock_dbgprint(lc->send_sock);
+    return 0;
+}
+
+static struct l4ag_operations *l4ag_ops_array[] = {
+    &l4ag_generic_ops,  /* L4AG_OPS_GENERIC */
+    &l4ag_ab_ops,       /* L4AG_OPS_ACTSTBY */
+};
+
+static int l4ag_set_operation(struct net *net, struct file *file,
+                              struct ifreq *ifr)
+{
+    struct l4ag_net *lnet;
+    struct l4ag_struct *ln;
+    int err, index;
+
+    lnet = net_generic(current->nsproxy->net_ns, l4ag_net_id);
+    ln = l4ag_get_by_name(lnet, ifr->ifr_name);
+    if (!ln)
+        return -EINVAL;
+    /* Does not permit change operation when device already running. */
+    if (ln->flags & L4AG_RUNNING)
+        return -EINVAL;
+
+    index = (int)ifr->ifr_data;
+    if (index < 0 || index >= sizeof(l4ag_ops_array)/sizeof(l4ag_ops_array[0]))
+        return -EINVAL;
+
+    DBG(KERN_INFO "l4ag: change operation, no = %d.\n", index);
+    ln->ops->release(ln);
+    ln->ops = l4ag_ops_array[index];
+    err = ln->ops->init(ln);
+
+    return err;
+}
+
 static int l4ag_fops_ioctl(struct inode *inode, struct file *file,
                       unsigned int cmd, unsigned long arg)
 {
@@ -804,9 +1064,8 @@ static int l4ag_fops_ioctl(struct inode *inode, struct file *file,
     struct ifreq ifr;
     int err;
 
-    if (cmd == L4AGIOCCREATE || cmd == L4AGIOCDELETE || cmd == L4AGIOCPEER)
-        if (copy_from_user(&ifr, argp, sizeof(ifr)))
-            return -EFAULT;
+    if (copy_from_user(&ifr, argp, sizeof(ifr)))
+        return -EFAULT;
 
     if (cmd == L4AGIOCCREATE) {
         ifr.ifr_name[IFNAMSIZ-1] = '\0';
@@ -834,6 +1093,22 @@ static int l4ag_fops_ioctl(struct inode *inode, struct file *file,
         ifr.ifr_name[IFNAMSIZ-1] = '\0';
         rtnl_lock();
         err = l4ag_connect_peer(current->nsproxy->net_ns, file, &ifr);
+        rtnl_unlock();
+        return err;
+    }
+
+    if (cmd == L4AGIOCSPRI) {
+        ifr.ifr_name[IFNAMSIZ-1] = '\0';
+        rtnl_lock();
+        err = l4ag_set_priority(current->nsproxy->net_ns, file, &ifr);
+        rtnl_unlock();
+        return err;
+    }
+
+    if (cmd == L4AGIOCSOPS) {
+        ifr.ifr_name[IFNAMSIZ-1] = '\0';
+        rtnl_lock();
+        err = l4ag_set_operation(current->nsproxy->net_ns, file, &ifr);
         rtnl_unlock();
         return err;
     }
