@@ -794,6 +794,8 @@ static void l4ag_delete_socket_ab(struct l4ag_struct *ln, struct l4conn *lc)
 
     /* should lock? */
     list_for_each_entry(ptr, &lc->l4st->l4conn_list, list) {
+        if (ptr == lc)
+            continue;
         if (primary == NULL || L4CONN_PRI_IS_HIGH(ptr, primary))
             primary = ptr;
     }
