@@ -985,6 +985,7 @@ static int l4conn_create_sendsock(struct l4conn *lc,
         DBG(KERN_INFO "l4ag: Can't connect to peer.\n");
         kernel_sock_shutdown(lc->send_sock, SHUT_RDWR);
         sock_release(lc->send_sock);
+        lc->send_sock = NULL;
         return err;
     }
 
@@ -1064,6 +1065,16 @@ static int l4ag_accept_thread(void *arg)
             /* create send socket */
             addr.sin_port = htons(16300);   // XXX should be variable
             err = l4conn_create_sendsock(lc, (struct sockaddr*)&addr, addrlen);
+            if (err < 0) {
+                /*
+                 * failed to create send socket.
+                 * discard connection and continue to accept.
+                 */
+                kernel_sock_shutdown(recv_sock, SHUT_RDWR);
+                sock_release(recv_sock);
+                l4ag_delete_l4conn(ln, lc);
+                continue;
+            }
         }
 
         lc->recv_sock = recv_sock;
