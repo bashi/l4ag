@@ -24,14 +24,37 @@ enum {
 };
 
 /* l4conn flags */
-#define L4CONN_ACTIVEOPEN   0x0001
-#define L4CONN_PASSIVEOPEN  0x0002
-#define L4CONN_RECVACTIVE   0x0004
-#define L4CONN_SENDACTIVE   0x0008
+#define L4CONN_ACTIVEOPEN       0x0001
+#define L4CONN_PASSIVEOPEN      0x0002
+#define L4CONN_RECVACTIVE       0x0004
+#define L4CONN_SENDACTIVE       0x0008
 #define L4CONN_ACTIVE (L4CONN_RECVACTIVE | L4CONN_SENDACTIVE)
+#define L4CONN_SETPRI_PENDING   0x0010
+
+#define L4CONN_IS_ACTIVE(lc) ((lc->flags&L4CONN_ACTIVE)==L4CONN_ACTIVE)
 
 /* Default variables */
 #define L4AG_DEFAULTPORT 16300
+#define L4AGCTL_PORT 16200
+
+/* Control message */
+enum {
+    L4AGCTL_MSG_SETPRI = 1,
+    L4AGCTL_MSG_MAX = 2,
+};
+
+struct l4agctl_msghdr {
+    __u8 type;
+    __u8 pad1;
+    __u16 length;
+} __attribute__((packed));
+
+struct l4agctl_setpri_msg {
+    struct l4agctl_msghdr hdr;
+    __u16 pri;
+    struct in_addr yaddr;
+    struct in_addr maddr;
+} __attribute__((packed));
 
 #ifdef __KERNEL__
 
@@ -52,6 +75,8 @@ struct l4ag_struct {
     struct socket *accept_sock;
     struct task_struct *accept_thread;
     struct task_struct *send_thread;
+    struct socket *ctl_sock;
+    struct task_struct *ctl_thread;
     struct list_head l4conn_list;
     struct l4ag_operations *ops;
 };
@@ -77,10 +102,24 @@ struct l4ag_operations {
     void (*add_sendsocket)(struct l4ag_struct *, struct l4conn *);
     void (*delete_recvsocket)(struct l4ag_struct *, struct l4conn *);
     void (*delete_sendsocket)(struct l4ag_struct *, struct l4conn *);
+    void (*change_priority)(struct l4ag_struct *, struct l4conn *);
     int (*recvpacket)(struct l4ag_struct *, struct l4conn *);
     int (*sendpacket)(struct l4ag_struct *);
     void *private_data;
 };
+
+#define L4AGCTL_MSGALLOC(ptr, cmd, type)         \
+({                                               \
+    ptr = kmalloc(sizeof(type), GFP_KERNEL);     \
+    if (ptr) {                                   \
+        (type*)ptr->hdr.type = cmd;              \
+        (type*)ptr->hdr.length = sizeof(type);   \
+    }                                            \
+    ptr;                                         \
+})
+
+#define L4AGCTL_INITMSG(msg, cmd) \
+    ({ msg.hdr.type = cmd; msg.hdr.length = htons(sizeof(msg)); })
 
 #endif /* __KERNEL__ */
 
