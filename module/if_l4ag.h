@@ -2,6 +2,9 @@
 #define __IF_L4AG_H
 
 #include <linux/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
 
 /* l4ag device flags */
 #define L4AG_UP         0x0001
@@ -15,6 +18,7 @@
 #define L4AGIOCPEER _IOW('L', 162, int)
 #define L4AGIOCSPRI _IOW('L', 163, int)
 #define L4AGIOCSOPS _IOW('L', 164, int)
+#define L4AGIOCDELPEER _IOW('L', 165, int)
 #define L4AGIOCSDEBUG _IOW('L', 170, int)
 
 /* Recv/Send operation types */
@@ -65,8 +69,8 @@ struct l4agctl_delpeer_msg {
 #ifdef __KERNEL__
 
 #include <linux/list.h>
-#include <linux/sched.h>
 #include <linux/socket.h>
+#include <linux/sched.h>
 
 struct l4ag_operations;
 
