@@ -46,12 +46,17 @@ static int debug = 1;
 # define DBG( a... )
 #endif
 
+#define ADDR_EQUAL(addr1, addr2) \
+    (memcmp((addr1), (addr2), sizeof(*(addr1))) == 0)
+
 static unsigned int l4ag_net_id;
 struct l4ag_net {
     struct list_head dev_list;
 };
 
 static const struct ethtool_ops l4ag_ethtool_ops;
+
+static int l4agctl_send_delpeer_msg(struct l4conn *);
 
 static void l4ag_inaddr_dbgprint(char *prefix, struct in_addr *addr)
 {
@@ -197,6 +202,38 @@ static ssize_t l4ag_fops_aio_read(struct kiocb *iocb, const struct iovec *iv,
     return -EBADFD;
 }
 
+static int l4conn_getsockname(struct l4conn *lc, struct sockaddr_in *addr)
+{
+    struct socket *sock = NULL;
+    int err, addrlen;
+    if (lc->recv_sock)
+        sock = lc->recv_sock;
+    else if (lc->send_sock)
+        sock = lc->send_sock;
+    else
+        return -ENOTCONN;
+
+    addrlen = sizeof(*addr);
+    err = kernel_getsockname(sock, (struct sockaddr *)addr, &addrlen);
+    return err;
+}
+
+static int l4conn_getpeername(struct l4conn *lc, struct sockaddr_in *addr)
+{
+    struct socket *sock = NULL;
+    int err, addrlen;
+    if (lc->recv_sock)
+        sock = lc->recv_sock;
+    else if (lc->send_sock)
+        sock = lc->send_sock;
+    else
+        return -ENOTCONN;
+
+    addrlen = sizeof(*addr);
+    err = kernel_getpeername(sock, (struct sockaddr *)addr, &addrlen);
+    return err;
+}
+
 static void l4ag_setup(struct net_device *dev)
 {
     dev->open = l4ag_net_open;
@@ -278,6 +315,10 @@ static void l4ag_delete_l4conn(struct l4ag_struct *ln, struct l4conn *lc)
 {
     /* XXX should use lock. */
     list_del(&lc->list);
+
+    /* notify close connection to the peer (if possible) */
+    l4agctl_send_delpeer_msg(lc);
+
     /* close connection. */
     if (lc->recv_sock) {
         DBG(KERN_INFO "l4ag: shutting down recvsock...\n");
@@ -295,9 +336,6 @@ static void l4ag_delete_l4conn(struct l4ag_struct *ln, struct l4conn *lc)
     kfree(lc);
     DBG(KERN_INFO "l4ag: delete l4conn struct.\n");
 }
-
-#define ADDR_EQUAL(addr1, addr2) \
-    (memcmp((addr1), (addr2), sizeof(*(addr1))) == 0)
 
 static struct l4conn *l4ag_get_l4conn_by_peeraddr(struct l4ag_struct *ln,
                                                   struct sockaddr_in *paddr)
@@ -331,28 +369,19 @@ static struct l4conn *l4ag_get_l4conn_by_pair(struct l4ag_struct *ln,
                                               struct in_addr *raddr)
 {
     struct l4conn *lc;
-    struct socket *sock;
     struct sockaddr_in addr;
-    int err, addrlen;
+    int err;
 
     /* XXX should lock? */
     list_for_each_entry(lc, &ln->l4conn_list, list) {
-        if (lc->flags & L4CONN_RECVACTIVE)
-            sock = lc->recv_sock;
-        else if (lc->flags & L4CONN_SENDACTIVE)
-            sock = lc->send_sock;
-        else
-            continue;   /* connection is not active */
-        addrlen = sizeof(addr);
-        err = kernel_getsockname(sock, (struct sockaddr*)&addr, &addrlen);
+        err = l4conn_getsockname(lc, &addr);
         if (err < 0) {
             DBG(KERN_INFO "l4ag: couldn't get socket address.\n");
             continue;
         }
         if (!ADDR_EQUAL(laddr, &addr.sin_addr))
             continue;
-        addrlen = sizeof(addr);
-        err = kernel_getpeername(sock, (struct sockaddr*)&addr, &addrlen);
+        err = l4conn_getpeername(lc, &addr);
         if (err < 0) {
             DBG(KERN_INFO "l4ag: couldn't get socket address.\n");
             continue;
@@ -427,33 +456,24 @@ static int l4agctl_sendmsg(struct l4ag_struct *ln, void *data, int len)
     return err;
 }
 
-static int l4agctl_create_recvsock(struct l4ag_struct *ln)
+static int l4agctl_send_delpeer_msg(struct l4conn *lc)
 {
-    int err;
     struct sockaddr_in addr;
+    struct l4agctl_delpeer_msg msg;
+    int err;
 
-    err = sock_create_kern(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &ln->ctl_sock);
+    DBG(KERN_INFO "l4ag: sending delpeer msg.\n");
+
+    err = l4conn_getpeername(lc, &addr);
     if (err < 0) {
-        DBG(KERN_INFO "l4ag: Can't create ctl socket.\n");
+        DBG(KERN_INFO "l4ag: can't get peername, failed to send ctlmsg.\n");
         return err;
     }
+    
+    L4AGCTL_INITMSG(msg, L4AGCTL_MSG_DELPEER);
+    memcpy(&msg.addr, &addr.sin_addr, sizeof(msg.addr));
 
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(L4AGCTL_PORT);
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    err = kernel_bind(ln->ctl_sock, (struct sockaddr*)&addr, sizeof(addr));
-    if (err < 0) {
-        DBG(KERN_INFO "l4ag: failed to bind ctl socket.\n");
-        goto release_out;
-    }
-
-    DBG(KERN_INFO "l4ag: ctl socket successfully created.\n");
-    return 0;
-
-release_out:
-    sock_release(ln->ctl_sock);
-    return err;
+    return l4agctl_sendmsg(lc->l4st, &msg, sizeof(msg));
 }
 
 static int l4agctl_send_setpri_msg(struct l4conn *lc)
@@ -486,6 +506,68 @@ static int l4agctl_send_setpri_msg(struct l4conn *lc)
     return err;
 }
 
+static int l4agctl_create_recvsock(struct l4ag_struct *ln)
+{
+    int err;
+    struct sockaddr_in addr;
+
+    err = sock_create_kern(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &ln->ctl_sock);
+    if (err < 0) {
+        DBG(KERN_INFO "l4ag: Can't create ctl socket.\n");
+        return err;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(L4AGCTL_PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    err = kernel_bind(ln->ctl_sock, (struct sockaddr*)&addr, sizeof(addr));
+    if (err < 0) {
+        DBG(KERN_INFO "l4ag: failed to bind ctl socket.\n");
+        goto release_out;
+    }
+
+    DBG(KERN_INFO "l4ag: ctl socket successfully created.\n");
+    return 0;
+
+release_out:
+    sock_release(ln->ctl_sock);
+    return err;
+}
+
+static int l4agctl_delpeer_handler(struct l4ag_struct *ln, void *data, int len)
+{
+    struct l4agctl_delpeer_msg *msg = (struct l4agctl_delpeer_msg *)data;
+    struct sockaddr_in addr;
+    struct l4conn *lc;
+    int err, addrlen;
+
+    DBG(KERN_INFO "l4ag: receive delpeer ctlmsg.\n");
+    if (len != sizeof(*msg)) {
+        DBG(KERN_INFO "l4ag: invalid msg length.\n");
+        return -EINVAL;
+    }
+
+retry:
+    list_for_each_entry(lc, &ln->l4conn_list, list) {
+        if (!(lc->flags & L4CONN_SENDACTIVE))
+            continue;
+        addrlen = sizeof(addr);
+        err = kernel_getsockname(lc->send_sock, (struct sockaddr *)&addr,
+                                 &addrlen);
+        if (err < 0)
+            continue;
+        if (ADDR_EQUAL(&msg->addr, &addr.sin_addr)) {
+            DBG(KERN_INFO "l4ag: deleting l4 connection.\n");
+            l4ag_inaddr_dbgprint("  addr: ", &msg->addr);
+            l4ag_delete_l4conn(ln, lc);
+            /* list chain is no longer valid in this loop, start from the top */
+            goto retry;
+        }
+    }
+    return 0;
+}
+
 static int l4agctl_setpri_handler(struct l4ag_struct *ln, void *data, int len)
 {
     struct l4agctl_setpri_msg *msg = (struct l4agctl_setpri_msg *)data;
@@ -515,8 +597,8 @@ static int l4agctl_setpri_handler(struct l4ag_struct *ln, void *data, int len)
 static struct l4agctl_msghandler {
     int (*handler)(struct l4ag_struct *, void *, int);
 } l4agctl_msghandlers[] = {
-    { NULL },
-    { l4agctl_setpri_handler },     /* L4AGCTL_SETPRI_MSG */
+    { l4agctl_delpeer_handler },    /* L4AGCTL_MSG_DELPEER */
+    { l4agctl_setpri_handler },     /* L4AGCTL_MSG_SETPRI */
 };
 
 static int l4agctl_recvthread(void *arg)

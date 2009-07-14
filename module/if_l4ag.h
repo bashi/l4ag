@@ -39,6 +39,7 @@ enum {
 
 /* Control message */
 enum {
+    L4AGCTL_MSG_DELPEER = 0,
     L4AGCTL_MSG_SETPRI = 1,
     L4AGCTL_MSG_MAX = 2,
 };
@@ -54,6 +55,11 @@ struct l4agctl_setpri_msg {
     __u16 pri;
     struct in_addr yaddr;
     struct in_addr maddr;
+} __attribute__((packed));
+
+struct l4agctl_delpeer_msg {
+    struct l4agctl_msghdr hdr;
+    struct in_addr addr;
 } __attribute__((packed));
 
 #ifdef __KERNEL__
