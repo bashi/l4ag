@@ -29,7 +29,7 @@ void usage() {
         "  l4ag-config create [-p <portnum>] [<ifname>]",
         "  l4ag-config delete <ifname>",
         "  l4ag-config peer [-s <ifname>] [-P <priority>] <ifname> <addr> [<portnum>]",
-        "  l4ag-config delpeer <ifname> <addr>",
+        "  l4ag-config deladdr <ifname> <addr>",
         "  l4ag-config algorithm <ifname> <algorithm>",
         "    <algorithm> = generic | actstby",
         NULL
@@ -126,7 +126,7 @@ int set_peer(int argc, char **argv)
     return ret;
 }
 
-int delete_peer(int argc, char **argv)
+int delete_addr(int argc, char **argv)
 {
     struct sockaddr_in *addr;
     struct addrinfo hints, *res;
@@ -149,8 +149,8 @@ int delete_peer(int argc, char **argv)
 
     /* XXX assume first addrinfo is the best information */
     addr = (struct sockaddr_in *)res->ai_addr;
-    printf("set peer, addr: %s\n", inet_ntoa(addr->sin_addr));
-    ret = l4agctl_delpeer_cmd(argv[0], &addr->sin_addr);
+    printf("delete addr: %s\n", inet_ntoa(addr->sin_addr));
+    ret = l4agctl_deladdr_cmd(argv[0], &addr->sin_addr);
     freeaddrinfo(res);
     return ret;
 }
@@ -188,7 +188,7 @@ struct l4ag_operations {
     { "create", create_device },
     { "delete", delete_device },
     { "peer", set_peer },
-    { "delpeer", delete_peer },
+    { "deladdr", delete_addr },
     { "algorithm", set_algorithm },
     { NULL, NULL }
 };

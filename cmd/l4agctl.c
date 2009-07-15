@@ -128,7 +128,7 @@ int l4agctl_setpeer_cmd(char *dev, struct sockaddr_in *sin, char *fromdev)
     return ret;
 }
 
-int l4agctl_delpeer_cmd(char *dev, struct in_addr *addr)
+int l4agctl_deladdr_cmd(char *dev, struct in_addr *addr)
 {
     struct ifreq ifr;
     struct sockaddr_in *sin;
@@ -138,7 +138,7 @@ int l4agctl_delpeer_cmd(char *dev, struct in_addr *addr)
         strncpy(ifr.ifr_name, dev, IFNAMSIZ);
     sin = (struct sockaddr_in*)&ifr.ifr_addr;
     memcpy(&sin->sin_addr, addr, sizeof(*addr));
-    return do_ioctl(L4AGIOCDELPEER, &ifr);
+    return do_ioctl(L4AGIOCDELADDR, &ifr);
 }
 
 int l4agctl_setalgorithm_cmd(char *dev, int index)

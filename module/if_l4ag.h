@@ -21,7 +21,7 @@
 #define L4AGIOCPEER _IOW('L', 162, int)
 #define L4AGIOCSPRI _IOW('L', 163, int)
 #define L4AGIOCSOPS _IOW('L', 164, int)
-#define L4AGIOCDELPEER _IOW('L', 165, int)
+#define L4AGIOCDELADDR _IOW('L', 165, int)
 #define L4AGIOCSDEBUG _IOW('L', 170, int)
 
 /* Recv/Send operation types */

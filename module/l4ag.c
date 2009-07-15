@@ -583,18 +583,13 @@ release_out:
     return err;
 }
 
-static int l4agctl_delpeer_handler(struct l4ag_struct *ln, void *data, int len)
+/* XXX strange function name */
+static int l4ag_delpeer(struct l4ag_struct *ln, struct in_addr *addr,
+                        int is_local)
 {
-    struct l4agctl_delpeer_msg *msg = (struct l4agctl_delpeer_msg *)data;
-    struct sockaddr_in addr;
     struct l4conn *lc;
+    struct sockaddr_in sin;
     int err, addrlen;
-
-    DBG(KERN_INFO "l4ag: receive delpeer ctlmsg.\n");
-    if (len != sizeof(*msg)) {
-        DBG(KERN_INFO "l4ag: invalid msg length.\n");
-        return -EINVAL;
-    }
 
 retry:
     list_for_each_entry(lc, &ln->l4conn_list, list) {
@@ -603,21 +598,40 @@ retry:
             if (lc->send_sock->sk->sk_state != TCP_CLOSE_WAIT)
                 continue;
         }
-        addrlen = sizeof(addr);
-        err = kernel_getpeername(lc->send_sock, (struct sockaddr *)&addr,
-                                 &addrlen);
+        addrlen = sizeof(sin);
+        if (is_local)
+            err = kernel_getsockname(lc->send_sock, (struct sockaddr *)&sin,
+                                     &addrlen);
+        else
+            err = kernel_getpeername(lc->send_sock, (struct sockaddr *)&sin,
+                                     &addrlen);
+
         if (err < 0)
             continue;
-        if (ADDR_EQUAL(&msg->addr, &addr.sin_addr)) {
+        if (ADDR_EQUAL(addr, &sin.sin_addr)) {
             lc->flags |= L4CONN_PASSIVECLOSE;
             DBG(KERN_INFO "l4ag: deleting l4 connection.\n");
-            l4ag_inaddr_dbgprint("  addr: ", &msg->addr);
+            l4ag_inaddr_dbgprint("  addr: ", addr);
             l4ag_delete_l4conn(ln, lc);
             /* list chain is no longer valid in this loop, start from the top */
             goto retry;
         }
     }
     return 0;
+}
+
+static int l4agctl_delpeer_handler(struct l4ag_struct *ln, void *data, int len)
+{
+    struct l4agctl_delpeer_msg *msg = (struct l4agctl_delpeer_msg *)data;
+
+    DBG(KERN_INFO "l4ag: receive delpeer ctlmsg.\n");
+    if (len != sizeof(*msg)) {
+        DBG(KERN_INFO "l4ag: invalid msg length.\n");
+        return -EINVAL;
+    }
+    l4ag_inaddr_dbgprint("  remote addr: ", &msg->addr);
+    /* delete connections */
+    return l4ag_delpeer(ln, &msg->addr, 0);
 }
 
 static int l4agctl_setpri_handler(struct l4ag_struct *ln, void *data, int len)
@@ -1419,6 +1433,34 @@ out:
     return err;
 }
 
+static int l4ag_delete_addr(struct net *net, struct file *file,
+                            struct ifreq *ifr)
+{
+    struct l4ag_net *lnet;
+    struct l4ag_struct *ln;
+    struct l4agctl_delpeer_msg msg;
+    struct sockaddr_in *sin;
+    int err;
+
+    lnet = net_generic(current->nsproxy->net_ns, l4ag_net_id);
+    ln = l4ag_get_by_name(lnet, ifr->ifr_name);
+    if (!ln)
+        return -EINVAL;
+
+    DBG(KERN_INFO "l4ag: delete addr request.\n");
+
+    /* send delpeer message to the peer. */
+    sin = (struct sockaddr_in *)&ifr->ifr_addr;
+    L4AGCTL_INITMSG(msg, L4AGCTL_MSG_DELPEER);
+    memcpy(&msg.addr, &sin->sin_addr, sizeof(msg.addr));
+    err = l4agctl_sendmsg(ln, &msg, sizeof(msg));
+    if (err < 0)
+        DBG(KERN_INFO "l4ag: can't send delpeer msg.\n");
+
+    /* deleting local connection */
+    return l4ag_delpeer(ln, &sin->sin_addr, 1);
+}
+
 static int l4ag_set_priority(struct net *net, struct file *file,
                              struct ifreq *ifr)
 {
@@ -1526,6 +1568,14 @@ static int l4ag_fops_ioctl(struct inode *inode, struct file *file,
         ifr.ifr_name[IFNAMSIZ-1] = '\0';
         rtnl_lock();
         err = l4ag_set_priority(current->nsproxy->net_ns, file, &ifr);
+        rtnl_unlock();
+        return err;
+    }
+
+    if (cmd == L4AGIOCDELADDR) {
+        ifr.ifr_name[IFNAMSIZ-1] = '\0';
+        rtnl_lock();
+        err = l4ag_delete_addr(current->nsproxy->net_ns, file, &ifr);
         rtnl_unlock();
         return err;
     }
