@@ -202,15 +202,24 @@ static ssize_t l4ag_fops_aio_read(struct kiocb *iocb, const struct iovec *iv,
     return -EBADFD;
 }
 
-static int l4conn_getsockname(struct l4conn *lc, struct sockaddr_in *addr)
+static struct socket *l4conn_activesocket(struct l4conn *lc)
 {
     struct socket *sock = NULL;
-    int err, addrlen;
+
     if (lc->recv_sock)
         sock = lc->recv_sock;
     else if (lc->send_sock)
         sock = lc->send_sock;
-    else
+    return sock;
+}
+
+static int l4conn_getsockname(struct l4conn *lc, struct sockaddr_in *addr)
+{
+    struct socket *sock = NULL;
+    int err, addrlen;
+
+    sock = l4conn_activesocket(lc);
+    if (!sock)
         return -ENOTCONN;
 
     addrlen = sizeof(*addr);
@@ -222,11 +231,9 @@ static int l4conn_getpeername(struct l4conn *lc, struct sockaddr_in *addr)
 {
     struct socket *sock = NULL;
     int err, addrlen;
-    if (lc->recv_sock)
-        sock = lc->recv_sock;
-    else if (lc->send_sock)
-        sock = lc->send_sock;
-    else
+
+    sock = l4conn_activesocket(lc);
+    if (!sock)
         return -ENOTCONN;
 
     addrlen = sizeof(*addr);
@@ -313,11 +320,12 @@ static struct l4conn *l4ag_create_l4conn(struct l4ag_struct *ln, int flags)
 
 static void l4ag_delete_l4conn(struct l4ag_struct *ln, struct l4conn *lc)
 {
+    /* notify close connection to the peer (if possible) */
+    if (lc->flags & L4CONN_ACTIVECLOSE)
+        l4agctl_send_delpeer_msg(lc);
+
     /* XXX should use lock. */
     list_del(&lc->list);
-
-    /* notify close connection to the peer (if possible) */
-    l4agctl_send_delpeer_msg(lc);
 
     /* close connection. */
     if (lc->recv_sock) {
@@ -411,11 +419,43 @@ static int l4ag_setrtpriority(struct task_struct *th)
     return sched_setscheduler(th, SCHED_FIFO, &param);
 }
 
+static int l4conn_is_send_active(struct l4conn *lc)
+{
+    if (!(lc->flags & L4CONN_SENDACTIVE)) {
+        DBG(KERN_INFO "l4ag: sendactive: !L4CONN_SENDACTIVE\n");
+        return 0;
+    }
+    if (!lc->send_sock) {
+        DBG(KERN_INFO "l4ag: sendactive: !send_sock\n");
+        return 0;
+    }
+    /* XXX umm.. we may need to accept other state. */
+    if (lc->send_sock->sk->sk_state != TCP_ESTABLISHED) {
+        DBG(KERN_INFO "l4ag: sendactive: !TCP_ESTABLISHED, state = %d\n",
+            lc->send_sock->sk->sk_state);
+        return 0;
+    }
+    return 1;
+}
+
+#if 0
+static int l4conn_is_recv_active(struct l4conn *lc)
+{
+    if (!(lc->flags & L4CONN_RECVACTIVE))
+        return 0;
+    if (!lc->recv_sock)
+        return 0;
+    if (lc->recv_sock->sk->sk_state != TCP_ESTABLISHED)
+        return 0;
+    return 1;
+}
+#endif
+
 /* Control message handling functions */
 
 static int l4agctl_sendmsg(struct l4ag_struct *ln, void *data, int len)
 {
-    struct l4conn *lc;
+    struct l4conn *lc = NULL, *ptr;
     struct sockaddr_in addr;
     struct socket *sock;
     struct kvec iov = { data, len };
@@ -428,11 +468,18 @@ static int l4agctl_sendmsg(struct l4ag_struct *ln, void *data, int len)
     };
     int err, addrlen;
 
-    if (list_empty(&ln->l4conn_list))
+    /* find first active send socket */
+    list_for_each_entry(ptr, &ln->l4conn_list, list) {
+        if (l4conn_is_send_active(ptr)) {
+            lc = ptr;
+            break;
+        }
+    }
+    if (!lc) {
+        DBG(KERN_INFO "l4ag: there is no active send socket.\n");
         return -ENOTCONN;
+    }
 
-    /* Use first send socket */
-    lc = list_first_entry(&ln->l4conn_list, struct l4conn, list);
     addrlen = sizeof(addr);
     err = kernel_getpeername(lc->recv_sock, (struct sockaddr*)&addr, &addrlen);
     if (err < 0) {
@@ -452,6 +499,7 @@ static int l4agctl_sendmsg(struct l4ag_struct *ln, void *data, int len)
     if (err != len)
         DBG(KERN_INFO "l4ag: failed to send ctl message.\n");
 
+    DBG(KERN_INFO "l4ag: ctl message send succesfully.\n");
     sock_release(sock);
     return err;
 }
@@ -464,12 +512,12 @@ static int l4agctl_send_delpeer_msg(struct l4conn *lc)
 
     DBG(KERN_INFO "l4ag: sending delpeer msg.\n");
 
-    err = l4conn_getpeername(lc, &addr);
+    err = l4conn_getsockname(lc, &addr);
     if (err < 0) {
-        DBG(KERN_INFO "l4ag: can't get peername, failed to send ctlmsg.\n");
+        DBG(KERN_INFO "l4ag: can't get sockname, failed to send ctlmsg.\n");
         return err;
     }
-    
+    l4ag_inaddr_dbgprint("l4ag: delete endpoint: ", &addr.sin_addr);
     L4AGCTL_INITMSG(msg, L4AGCTL_MSG_DELPEER);
     memcpy(&msg.addr, &addr.sin_addr, sizeof(msg.addr));
 
@@ -550,14 +598,18 @@ static int l4agctl_delpeer_handler(struct l4ag_struct *ln, void *data, int len)
 
 retry:
     list_for_each_entry(lc, &ln->l4conn_list, list) {
-        if (!(lc->flags & L4CONN_SENDACTIVE))
-            continue;
+        /* skip inactive connection (expect half close connection) */
+        if (!l4conn_is_send_active(lc)) {
+            if (lc->send_sock->sk->sk_state != TCP_CLOSE_WAIT)
+                continue;
+        }
         addrlen = sizeof(addr);
-        err = kernel_getsockname(lc->send_sock, (struct sockaddr *)&addr,
+        err = kernel_getpeername(lc->send_sock, (struct sockaddr *)&addr,
                                  &addrlen);
         if (err < 0)
             continue;
         if (ADDR_EQUAL(&msg->addr, &addr.sin_addr)) {
+            lc->flags |= L4CONN_PASSIVECLOSE;
             DBG(KERN_INFO "l4ag: deleting l4 connection.\n");
             l4ag_inaddr_dbgprint("  addr: ", &msg->addr);
             l4ag_delete_l4conn(ln, lc);
@@ -761,7 +813,7 @@ int l4ag_sendpacket_generic(struct l4ag_struct *ln)
 
     /* Use first send_sock */
     lc = list_first_entry(&ln->l4conn_list, struct l4conn, list);
-    if (!(lc->flags & L4CONN_SENDACTIVE)) {
+    if (!l4conn_is_send_active(lc)) {
         DBG(KERN_INFO "l4ag: there is no send socket.\n");
         return -EINVAL;
     }
@@ -920,7 +972,7 @@ static int l4ag_sendpacket_ab(struct l4ag_struct *ln)
     }
 
     send_sock = abinfo->primary_lc->send_sock;
-    if (!(abinfo->primary_lc->flags & L4CONN_SENDACTIVE)) {
+    if (!l4conn_is_send_active(abinfo->primary_lc)) {
         DBG(KERN_INFO "l4ag: primary send_sock is not active.\n");
         return -EINVAL;
     }
@@ -1156,6 +1208,7 @@ static int l4ag_accept_thread(void *arg)
                  */
                 kernel_sock_shutdown(recv_sock, SHUT_RDWR);
                 sock_release(recv_sock);
+                lc->flags |= L4CONN_ACTIVECLOSE;
                 l4ag_delete_l4conn(ln, lc);
                 continue;
             }
@@ -1294,6 +1347,13 @@ static int l4ag_delete_device(struct net *net, struct file *file,
     ln->flags &= ~(L4AG_RUNNING | L4AG_UP);
     ln->ops->release(ln);
 
+    /* Delete L4 connections. */
+    while (!list_empty(&ln->l4conn_list)) {
+        lc = list_first_entry(&ln->l4conn_list, struct l4conn, list);
+        lc->flags |= L4CONN_ACTIVECLOSE;
+        l4ag_delete_l4conn(ln, lc);
+    }
+
     /*
      * Shutdown sockets.
      * This will stop accept/ctl thread.
@@ -1306,12 +1366,6 @@ static int l4ag_delete_device(struct net *net, struct file *file,
     if (ln->ctl_sock) {
         DBG(KERN_INFO "l4ag: shutting down ctlsock...\n");
         kernel_sock_shutdown(ln->ctl_sock, SHUT_RDWR);
-    }
-
-    /* Delete L4 connections. */
-    while (!list_empty(&ln->l4conn_list)) {
-        lc = list_first_entry(&ln->l4conn_list, struct l4conn, list);
-        l4ag_delete_l4conn(ln, lc);
     }
 
     /* Stop sender thread. */

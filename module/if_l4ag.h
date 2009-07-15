@@ -2,13 +2,16 @@
 #define __IF_L4AG_H
 
 #include <linux/types.h>
+
+#ifndef __KERNEL__
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#endif
 
 /* l4ag device flags */
 #define L4AG_UP         0x0001
-#define L4AG_RUNNING    0x0010
+#define L4AG_RUNNING    0x0002
 #define L4AG_PERSIST    0x0100
 #define L4AG_DEBUG      0x1000
 
@@ -30,10 +33,12 @@ enum {
 /* l4conn flags */
 #define L4CONN_ACTIVEOPEN       0x0001
 #define L4CONN_PASSIVEOPEN      0x0002
-#define L4CONN_RECVACTIVE       0x0004
-#define L4CONN_SENDACTIVE       0x0008
+#define L4CONN_ACTIVECLOSE      0x0004
+#define L4CONN_PASSIVECLOSE     0x0008
+#define L4CONN_RECVACTIVE       0x0010
+#define L4CONN_SENDACTIVE       0x0020
 #define L4CONN_ACTIVE (L4CONN_RECVACTIVE | L4CONN_SENDACTIVE)
-#define L4CONN_SETPRI_PENDING   0x0010
+#define L4CONN_SETPRI_PENDING   0x0100
 
 #define L4CONN_IS_ACTIVE(lc) ((lc->flags&L4CONN_ACTIVE)==L4CONN_ACTIVE)
 

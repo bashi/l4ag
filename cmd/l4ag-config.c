@@ -21,8 +21,7 @@
 #include <linux/rtnetlink.h>
 
 #include "if_l4ag.h"
-
-#define L4AG_DEVICE "/dev/l4ag"
+#include "l4agctl.h"
 
 void usage() {
     char *lines[] = {
@@ -30,6 +29,7 @@ void usage() {
         "  l4ag-config create [-p <portnum>] [<ifname>]",
         "  l4ag-config delete <ifname>",
         "  l4ag-config peer [-s <ifname>] [-P <priority>] <ifname> <addr> [<portnum>]",
+        "  l4ag-config delpeer <ifname> <addr>",
         "  l4ag-config algorithm <ifname> <algorithm>",
         "    <algorithm> = generic | actstby",
         NULL
@@ -44,28 +44,9 @@ void exit_with_usage() {
     exit(1);
 }
 
-int do_ioctl(int cmd, struct ifreq *ifr)
-{
-    int fd;
-
-    if ((fd = open(L4AG_DEVICE, O_RDWR)) < 0) {
-        perror("open");
-        return -1;
-    }
-
-    if (ioctl(fd, cmd, (void*)ifr) < 0) {
-        perror("ioctl");
-        close(fd);
-        return -1;
-    }
-
-    close(fd);
-    return 0;
-}
-
 int create_device(int argc, char **argv)
 {
-    struct ifreq ifr;
+    char *dev;
     int portnum = L4AG_DEFAULTPORT;
 
     if (argc > 1 && (strcmp(argv[0], "-p") == 0)) {
@@ -74,90 +55,33 @@ int create_device(int argc, char **argv)
         argv += 2;
     }
 
-    memset(&ifr, 0, sizeof(ifr));
     if (argc >= 1)
-        strncpy(ifr.ifr_name, argv[0], IFNAMSIZ);
-    *((int*)&ifr.ifr_data) = portnum;
-    return do_ioctl(L4AGIOCCREATE, &ifr);
+        dev = argv[0];
+    else
+        dev = NULL;
+    return l4agctl_createdevice_cmd(dev, portnum);
 }
 
 int delete_device(int argc, char **argv)
 {
-    struct ifreq ifr;
-
     if (argc < 1) exit_with_usage();
 
-    memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, argv[0], IFNAMSIZ);
-    return do_ioctl(L4AGIOCDELETE, &ifr);
-}
-
-/* IPv4 only */
-int request_hostroute(int cmd, char *dest, char *dev)
-{
-    struct rtentry rt;
-    struct sockaddr_in *addr;
-    unsigned int netmask = 0xffffffff;
-    int fd, err = 0;
-
-    memset(&rt, 0, sizeof(rt));
-    rt.rt_flags = RTF_UP | RTF_HOST;
-    addr = (struct sockaddr_in*)&rt.rt_dst;
-    addr->sin_family = AF_INET;
-    addr->sin_addr.s_addr = inet_addr(dest);
-    addr = (struct sockaddr_in*)&rt.rt_genmask;
-    addr->sin_family = AF_INET;
-    addr->sin_addr.s_addr = netmask;
-    rt.rt_dev = dev;
-
-    fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) {
-        perror("socket");
-        return fd;
-    }
-    err = ioctl(fd, cmd, &rt);
-    if (err < 0) {
-        perror("ioctl");
-    }
-    close(fd);
-    return err;
-}
-
-int add_hostroute(char *dest, char *dev)
-{
-    return request_hostroute(SIOCADDRT, dest, dev);
-}
-
-int remove_hostroute(char *dest, char *dev)
-{
-    return request_hostroute(SIOCDELRT, dest, dev);
-}
-
-int set_priority(char *dev, int priority)
-{
-    struct ifreq ifr;
-
-    memset(&ifr, 0, sizeof(ifr));
-    memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, dev, IFNAMSIZ);
-    *((int*)&ifr.ifr_data) = priority;
-    return do_ioctl(L4AGIOCSPRI, &ifr);
+    return l4agctl_deletedevice_cmd(argv[0]);
 }
 
 int set_peer(int argc, char **argv)
 {
-    struct ifreq ifr;
     struct sockaddr_in *addr;
     struct addrinfo hints, *res;
-    char *dev = NULL;
-    int error, priority = 0;
+    char *dev = NULL, *fromdev = NULL;
+    int ret, priority = 0;
 
     while (argc > 2 && (*argv)[0] == '-') {
         switch ((*argv)[1]) {
         case 's':
-            dev = *(++argv);
+            fromdev = *(++argv);
             argc--;
-            printf("src device = %s\n", dev);
+            printf("src device = %s\n", fromdev);
             break;
         case 'P':
             priority = atoi(*(++argv));
@@ -171,41 +95,64 @@ int set_peer(int argc, char **argv)
     }
 
     if (argc != 2) exit_with_usage();
+    dev = argv[0];
 
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
-    error = getaddrinfo(argv[1], NULL, &hints, &res);
-    if (error) {
-        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(error));
+    ret = getaddrinfo(argv[1], NULL, &hints, &res);
+    if (ret) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(ret));
         return -1;
     }
 
     if (res == NULL)
         return -1;
 
-    memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, argv[0], IFNAMSIZ);
-    addr = (struct sockaddr_in *)&ifr.ifr_addr;
     /* XXX assume first addrinfo is the best information */
-    memcpy(addr, res->ai_addr, res->ai_addrlen);
+    addr = (struct sockaddr_in *)res->ai_addr;
     printf("set peer, addr: %s\n", inet_ntoa(addr->sin_addr));
     if (argc > 2) {
         addr->sin_port = htons(atoi(argv[2]));
     } else {
         addr->sin_port = htons(L4AG_DEFAULTPORT);
     }
-    if (dev)
-        add_hostroute(inet_ntoa(addr->sin_addr), dev);
-    error = do_ioctl(L4AGIOCPEER, &ifr);
-    if (dev)
-        remove_hostroute(inet_ntoa(addr->sin_addr), dev);
+    ret = l4agctl_setpeer_cmd(dev, addr, fromdev);
     freeaddrinfo(res);
-    if (error < 0)
-        return error;
+    if (ret < 0)
+        return ret;
     if (priority > 0) 
-        error = set_priority(argv[0], priority);
-    return error;
+        ret = l4agctl_setpri_cmd(dev, priority);
+    return ret;
+}
+
+int delete_peer(int argc, char **argv)
+{
+    struct sockaddr_in *addr;
+    struct addrinfo hints, *res;
+    int ret;
+
+    if (argc != 2)
+        exit_with_usage();
+    
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    ret = getaddrinfo(argv[1], NULL, &hints, &res);
+    if (ret) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(ret));
+        return -1;
+    }
+
+    if (res == NULL)
+        return -1;
+
+    /* XXX assume first addrinfo is the best information */
+    addr = (struct sockaddr_in *)res->ai_addr;
+    printf("set peer, addr: %s\n", inet_ntoa(addr->sin_addr));
+    ret = l4agctl_delpeer_cmd(argv[0], &addr->sin_addr);
+    freeaddrinfo(res);
+    return ret;
 }
 
 char *algorithm_names[] = {
@@ -218,7 +165,6 @@ static const int algorithm_maxindex =
 
 int set_algorithm(int argc, char **argv)
 {
-    struct ifreq ifr;
     int index = 0;
 
     if (argc != 2)
@@ -232,10 +178,7 @@ int set_algorithm(int argc, char **argv)
     if (index >= algorithm_maxindex)
         return -1;
 
-    memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, argv[0], IFNAMSIZ);
-    *((int*)&ifr.ifr_data) = index;
-    return do_ioctl(L4AGIOCSOPS, &ifr);
+    return l4agctl_setalgorithm_cmd(argv[0], index);
 }
 
 struct l4ag_operations {
@@ -245,6 +188,7 @@ struct l4ag_operations {
     { "create", create_device },
     { "delete", delete_device },
     { "peer", set_peer },
+    { "delpeer", delete_peer },
     { "algorithm", set_algorithm },
     { NULL, NULL }
 };
