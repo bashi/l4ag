@@ -4,6 +4,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <ctype.h>
@@ -20,6 +21,65 @@
 #include <linux/rtnetlink.h>
 
 #include "if_l4ag.h"
+#include "l4agctl.h"
+
+/*
+ * monitor functions.
+ * XXX these implementation just for test for now...
+ */
+struct l4agmon {
+    char ifname[IFNAMSIZ];
+    struct sockaddr_in paddr;
+};
+
+struct device_priority {
+    char *ifprefix;
+    int priority;
+} device_priorities[] = {
+    { .ifprefix = "eth", .priority = 10 },
+    { .ifprefix = "wlan", .priority = 100 },
+    { .ifprefix = NULL, .priority = 255 }
+};
+
+static int get_priority(char *dev)
+{
+    struct device_priority *dp;
+    for (dp = device_priorities; dp->ifprefix; dp++) {
+        if (strncmp(dp->ifprefix, dev, strlen(dp->ifprefix)) == 0)
+            return dp->priority;
+    }
+    return 255;
+}
+
+void l4agmon_addr_assigned(struct l4agmon *lm, char *dev, struct in_addr *addr)
+{
+    int err, pri;
+    printf("creating connection associated, local addr %s ...\n",
+           inet_ntoa(*addr));
+    /* XXX sleep 5 seconds to wait for stabilize lower layer stabilization. */
+    sleep(5);
+
+    err = l4agctl_setpeer_cmd(lm->ifname, &lm->paddr, dev);
+    if (err < 0) {
+        fprintf(stderr, "Can't set peer.\n");
+        return;
+    }
+
+    /* set priority */
+    pri = get_priority(dev);
+    l4agctl_setpri_cmd(lm->ifname, pri);
+}
+
+void l4agmon_addr_deleted(struct l4agmon *lm, char *dev, struct in_addr *addr)
+{
+    printf("deleting connection associated with local addr %s ...\n",
+           inet_ntoa(*addr));
+    l4agctl_deladdr_cmd(lm->ifname, addr);
+}
+
+/*
+ * rtnetlink handling functions
+ */
 
 struct nlrequest {
     struct nlmsghdr nh;
@@ -29,6 +89,7 @@ struct nlrequest {
 struct nlinfo {
     int fd;
     int seqno;
+    struct l4agmon lm;
     struct nlrequest req;
 };
 
@@ -111,6 +172,7 @@ ssize_t nl_send_request(struct nlinfo *nli)
     return len;
 }
 
+static void print_rtattr_ifa(char *prefix, struct rtattr *rta) __attribute__((unused));
 static void print_rtattr_ifa(char *prefix, struct rtattr *rta)
 {
     struct in_addr addr;
@@ -142,43 +204,61 @@ static void print_rtattr_ifa(char *prefix, struct rtattr *rta)
     printf("\n");
 }
 
-int nlmsg_newaddr_handler(struct nlmsghdr *rnh)
+int nlmsg_newaddr_handler(struct nlinfo *nli, struct nlmsghdr *rnh)
 {
     char ifname[IFNAMSIZ];
+    struct in_addr *addr;
     struct ifaddrmsg *ifa = (struct ifaddrmsg *)NLMSG_DATA(rnh);
     struct rtattr *rta;
 
     getifnamebyindex(ifa->ifa_index, ifname);
+    /* ignore event which occurred on virtual interface */
+    if (strncmp(ifname, nli->lm.ifname, IFNAMSIZ) == 0)
+        return 0;
     printf("address assigned on %s\n", ifname);
 
     rta = (struct rtattr *)((char *)NLMSG_DATA(rnh)
                             + NLMSG_ALIGN(sizeof(*ifa)));
     for (; RTA_OK(rta, rnh->nlmsg_len);
          rta = RTA_NEXT(rta, rnh->nlmsg_len)) {
-        print_rtattr_ifa("  attr: ", rta);
+        //print_rtattr_ifa("  attr: ", rta);
+        if (rta->rta_type == IFA_LOCAL) {   /* address assigned on this if. */
+            addr = (struct in_addr *)RTA_DATA(rta);
+            printf("  addr: %s\n", inet_ntoa(*addr));
+            l4agmon_addr_assigned(&nli->lm, ifname, addr);
+        }
     }
     return 0;
 }
 
-int nlmsg_deladdr_handler(struct nlmsghdr *rnh)
+int nlmsg_deladdr_handler(struct nlinfo *nli, struct nlmsghdr *rnh)
 {
     char ifname[IFNAMSIZ];
+    struct in_addr *addr;
     struct ifaddrmsg *ifa = (struct ifaddrmsg *)NLMSG_DATA(rnh);
     struct rtattr *rta;
 
     getifnamebyindex(ifa->ifa_index, ifname);
+    /* ignore event which occurred on virtual interface */
+    if (strncmp(ifname, nli->lm.ifname, IFNAMSIZ) == 0)
+        return 0;
     printf("address deleted on %s\n", ifname);
 
     rta = (struct rtattr *)((char *)NLMSG_DATA(rnh)
                             + NLMSG_ALIGN(sizeof(*ifa)));
     for (; RTA_OK(rta, rnh->nlmsg_len);
          rta = RTA_NEXT(rta, rnh->nlmsg_len)) {
-        print_rtattr_ifa("  attr: ", rta);
+        //print_rtattr_ifa("  attr: ", rta);
+        if (rta->rta_type == IFA_LOCAL) {   /* address deleted on this if. */
+            addr = (struct in_addr *)RTA_DATA(rta);
+            printf("  addr: %s\n", inet_ntoa(*addr));
+            l4agmon_addr_deleted(&nli->lm, ifname, addr);
+        }
     }
     return 0;
 }
 
-int nlmsg_newroute_handler(struct nlmsghdr *rnh)
+int nlmsg_newroute_handler(struct nlinfo *nli, struct nlmsghdr *rnh)
 {
     struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(rnh);
     printf("route added, type: %d, proto: %d, scope: %d\n",
@@ -186,7 +266,7 @@ int nlmsg_newroute_handler(struct nlmsghdr *rnh)
     return 0;
 }
 
-int nlmsg_delroute_handler(struct nlmsghdr *rnh)
+int nlmsg_delroute_handler(struct nlinfo *nli, struct nlmsghdr *rnh)
 {
     struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(rnh);
     printf("route deleted, type: %d, proto: %d, scope: %d\n",
@@ -194,7 +274,7 @@ int nlmsg_delroute_handler(struct nlmsghdr *rnh)
     return 0;
 }
 
-int nlmsg_error_handler(struct nlmsghdr *rnh)
+int nlmsg_error_handler(struct nlinfo *nli, struct nlmsghdr *rnh)
 {
     struct nlmsgerr *err = (struct nlmsgerr*)NLMSG_DATA(rnh);
     fprintf(stderr, "error has occured, err = %d, seqno = %d\n",
@@ -204,7 +284,7 @@ int nlmsg_error_handler(struct nlmsghdr *rnh)
 
 struct nlmsg_handler {
     int type;
-    int (*handler)(struct nlmsghdr *);
+    int (*handler)(struct nlinfo *, struct nlmsghdr *);
 } nlmsg_handlers[] = {
     { .type = RTM_NEWADDR, .handler = nlmsg_newaddr_handler },
     { .type = RTM_DELADDR, .handler = nlmsg_deladdr_handler },
@@ -214,39 +294,30 @@ struct nlmsg_handler {
     { .type = -1, .handler = NULL },
 };
 
-int nl_handle_message(struct nlmsghdr *rnh)
+int nl_handle_message(struct nlinfo *nli, struct nlmsghdr *rnh)
 {
     struct nlmsg_handler *nlh;
+#if 0
     printf("nlmsghdr nlmsg_len = %d, type = %d\n",
            rnh->nlmsg_len, rnh->nlmsg_type);
+#endif
     for (nlh = nlmsg_handlers; nlh->type != -1; nlh++) {
         if (nlh->type == rnh->nlmsg_type)
-            return nlh->handler(rnh);
+            return nlh->handler(nli, rnh);
     }
     return -1;
 }
 
-int nlwatch(void *arg)
+int nlwatch(struct nlinfo *nli)
 {
-    struct nlinfo nli;
     struct nlmsghdr *rnh;
     char buf[8192];
     int ret;
     ssize_t len;
 
-    memset(&nli, 0, sizeof(nli));
-    nli.seqno = 1;
-    nli.fd = open_rtnetlink();
-    if (nli.fd < 0)
-        return -1;
-    nli.req.nh.nlmsg_len = NLMSG_LENGTH(sizeof(struct sockaddr_nl));
-    nli.req.nh.nlmsg_flags = NLM_F_REQUEST;
-    nli.req.nh.nlmsg_pid = 0;  /* target is the kernel */
-    nli.req.sa.nl_family = AF_NETLINK;
-
     while (1) {
-        nl_send_request(&nli);  /* request message. */
-        len = read(nli.fd, buf, sizeof(buf));
+        nl_send_request(nli);  /* request message. */
+        len = read(nli->fd, buf, sizeof(buf));
         if (len < 0) {
             perror("read");
             break;
@@ -257,7 +328,7 @@ int nlwatch(void *arg)
              rnh = NLMSG_NEXT(rnh, len)) {
             if (rnh->nlmsg_type == NLMSG_DONE)
                 break;
-            ret = nl_handle_message(rnh);
+            ret = nl_handle_message(nli, rnh);
             if (ret < 0)
                 break;
         }
@@ -265,7 +336,56 @@ int nlwatch(void *arg)
     return 0;
 }
 
+int init_nlinfo(struct nlinfo *nli)
+{
+    memset(nli, 0, sizeof(*nli));
+    nli->seqno = 0;
+    nli->fd = open_rtnetlink();
+    if (nli->fd < 0)
+        return -1;
+    nli->req.nh.nlmsg_len = NLMSG_LENGTH(sizeof(struct sockaddr_nl));
+    nli->req.nh.nlmsg_flags = NLM_F_REQUEST;
+    nli->req.nh.nlmsg_pid = 0;  /* target is the kernel */
+    nli->req.sa.nl_family = AF_NETLINK;
+    return 0;
+}
+
+void usage()
+{
+    char *lines[] = {
+        "usage:",
+        "  l4agmond [-p <portnum>] <ifname> <remote-addr>",
+        NULL
+    };
+    char **p = lines;
+    while (*p)
+        fprintf(stderr, "%s\n", *p++);
+}
+
+void exit_with_usage()
+{
+    usage();
+    exit(1);
+}
+
 int main(int argc, char **argv)
 {
-    return nlwatch(NULL);
+    struct nlinfo nli;
+    int err;
+
+    /* support portnum */
+    if (argc != 3)
+        exit_with_usage();
+
+    err = init_nlinfo(&nli);
+    if (err < 0)
+        return err;
+
+    strncpy(nli.lm.ifname, argv[1], IFNAMSIZ);
+    /* XXX should support hostname */
+    nli.lm.paddr.sin_addr.s_addr = inet_addr(argv[2]);
+    nli.lm.paddr.sin_port = htons(L4AG_DEFAULTPORT);
+    printf("if = %s, addr = %s\n", nli.lm.ifname,
+           inet_ntoa(nli.lm.paddr.sin_addr));
+    return nlwatch(&nli);
 }

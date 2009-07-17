@@ -1414,6 +1414,7 @@ static int l4ag_connect_peer(struct net *net, struct file *file,
 
     /* active connection establishment. */
     DBG(KERN_INFO "l4ag: connection active open.\n");
+    l4ag_sockaddr_dbgprint("  remote: ", &ifr->ifr_addr);
     /* ToDo: check whether connection is already exists. */
     lc = l4ag_create_l4conn(ln, L4CONN_ACTIVEOPEN);
     if (lc == NULL) {

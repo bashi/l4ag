@@ -121,7 +121,7 @@ int set_peer(int argc, char **argv)
     freeaddrinfo(res);
     if (ret < 0)
         return ret;
-    if (priority > 0) 
+    if (priority > 0)
         ret = l4agctl_setpri_cmd(dev, priority);
     return ret;
 }
