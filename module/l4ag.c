@@ -38,7 +38,7 @@
 static int debug = 1;
 
 /* uncomment this to debug. */
-//#define DEBUG 1
+#define DEBUG 1
 
 #ifdef DEBUG
 # define DBG if(debug)printk
@@ -1035,6 +1035,112 @@ static struct l4ag_operations __attribute__((unused)) l4ag_ab_ops = {
     .private_data = NULL
 };
 
+
+/* Roundrobin recv/send algorithm */
+
+struct l4ag_rr_info {
+    struct l4conn *lc;
+};
+
+static int l4ag_init_rr(struct l4ag_struct *ln)
+{
+    struct l4ag_rr_info *rr;
+
+    rr = kmalloc(sizeof(*rr), GFP_KERNEL | GFP_ATOMIC);
+    if (!rr)
+        return -ENOMEM;
+    rr->lc = NULL;
+    ln->ops->private_data = rr;
+    DBG(KERN_INFO "l4ag: roundrobin operation initialized.\n");
+    return 0;
+}
+
+static void l4ag_release_rr(struct l4ag_struct *ln)
+{
+    struct l4ag_rr_info *rr = (struct l4ag_rr_info *)ln->ops->private_data;
+    if (rr)
+        kfree(rr);
+    DBG(KERN_INFO "l4ag: roundrobin operation released.\n");
+}
+
+static void l4ag_add_socket_rr(struct l4ag_struct *ln, struct l4conn *lc)
+{
+    struct l4ag_rr_info *rr = (struct l4ag_rr_info *)ln->ops->private_data;
+
+    rr->lc = NULL;
+}
+
+static void l4ag_delete_socket_rr(struct l4ag_struct *ln, struct l4conn *lc)
+{
+    struct l4ag_rr_info *rr = (struct l4ag_rr_info *)ln->ops->private_data;
+
+    rr->lc = NULL;
+}
+
+static int l4ag_recvpacket_rr(struct l4ag_struct *ln, struct l4conn *lc)
+{
+    return l4ag_recvpacket_generic(ln, lc);
+}
+
+static int l4ag_sendpacket_rr(struct l4ag_struct *ln)
+{
+    struct sk_buff *skb;
+    struct l4ag_rr_info *rr = ln->ops->private_data;
+    int len;
+
+reloop:
+    if (list_empty(&ln->l4conn_list))
+        return -EINVAL;
+
+    if (rr->lc == NULL)
+        rr->lc = list_first_entry(&ln->l4conn_list, struct l4conn, list);
+
+    list_for_each_entry_from(rr->lc, &ln->l4conn_list, list) {
+        if (!l4conn_is_send_active(rr->lc)) {
+            l4ag_delete_l4conn(ln, rr->lc);
+            rr->lc = NULL;
+            goto reloop;
+        }
+        skb = skb_dequeue(&ln->sendq);
+        if (!skb)
+            goto out;
+        DBG(KERN_INFO "l4ag: roundrobin send packet.\n");
+        l4ag_sock_dbgprint(rr->lc->send_sock);
+resend:
+        len = l4ag_sendsock(rr->lc->send_sock, skb->data, skb->len, 0);
+        if (len < 0) {
+            printk(KERN_INFO "l4ag: failed to send packet.\n");
+            return len;
+        }
+        if (len != skb->len) {
+            ln->dev->stats.tx_bytes += len;
+            skb_pull(skb, len);
+            goto resend;
+        }
+        ln->dev->stats.tx_packets++;
+        ln->dev->stats.tx_bytes += len;
+        kfree_skb(skb);
+    }
+    rr->lc = list_first_entry(&ln->l4conn_list, struct l4conn, list);
+    if (!skb_queue_empty(&ln->sendq))
+        goto reloop;
+out:
+    return 0;
+}
+
+static struct l4ag_operations __attribute__((unused)) l4ag_rr_ops = {
+    .init = l4ag_init_rr,
+    .release = l4ag_release_rr,
+    .add_recvsocket = l4ag_add_socket_rr,
+    .add_sendsocket = l4ag_add_socket_rr,
+    .delete_recvsocket = l4ag_delete_socket_rr,
+    .delete_sendsocket = l4ag_delete_socket_rr,
+    .change_priority = l4ag_change_priority_generic,
+    .recvpacket = l4ag_recvpacket_rr,
+    .sendpacket = l4ag_sendpacket_rr,
+    .private_data = NULL
+};
+
 /* Receiver thread */
 static int l4ag_recvthread(void *arg)
 {
@@ -1504,6 +1610,7 @@ static int l4ag_set_priority(struct net *net, struct file *file,
 static struct l4ag_operations *l4ag_ops_array[] = {
     &l4ag_generic_ops,  /* L4AG_OPS_GENERIC */
     &l4ag_ab_ops,       /* L4AG_OPS_ACTSTBY */
+    &l4ag_rr_ops,       /* L4AG_OPS_RR */
 };
 
 static int l4ag_set_operation(struct net *net, struct file *file,
@@ -1522,7 +1629,7 @@ static int l4ag_set_operation(struct net *net, struct file *file,
         return -EINVAL;
 
     index = (int)ifr->ifr_data;
-    if (index < 0 || index >= sizeof(l4ag_ops_array)/sizeof(l4ag_ops_array[0]))
+    if (index < 0 || index >= __L4AG_OPS_MAX)
         return -EINVAL;
 
     DBG(KERN_INFO "l4ag: change operation, no = %d.\n", index);

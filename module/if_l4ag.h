@@ -26,8 +26,10 @@
 
 /* Recv/Send operation types */
 enum {
-    L4AG_OPS_GENERIC = 0,
-    L4AG_OPS_ACTSTBY = 1
+    L4AG_OPS_GENERIC = 0,   /* generic operation */
+    L4AG_OPS_ACTSTBY = 1,   /* active/backup operation */
+    L4AG_OPS_RR = 2,        /* roundrobin operation */
+    __L4AG_OPS_MAX = 3,
 };
 
 /* l4conn flags */

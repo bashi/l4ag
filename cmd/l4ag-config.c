@@ -31,7 +31,7 @@ void usage() {
         "  l4ag-config peer [-s <ifname>] [-P <priority>] <ifname> <addr> [<portnum>]",
         "  l4ag-config deladdr <ifname> <addr>",
         "  l4ag-config algorithm <ifname> <algorithm>",
-        "    <algorithm> = generic | actstby",
+        "    <algorithm> = generic | actstby | rr",
         NULL
     };
     char **p = lines;
@@ -157,11 +157,9 @@ int delete_addr(int argc, char **argv)
 
 char *algorithm_names[] = {
     "generic",
-    "actstby"
+    "actstby",
+    "rr"
 };
-
-static const int algorithm_maxindex = 
-    sizeof(algorithm_names) / sizeof(algorithm_names[0]);
 
 int set_algorithm(int argc, char **argv)
 {
@@ -170,12 +168,12 @@ int set_algorithm(int argc, char **argv)
     if (argc != 2)
         exit_with_usage();
 
-    while (index < algorithm_maxindex) {
+    while (index < __L4AG_OPS_MAX) {
         if (strcmp(algorithm_names[index], argv[1]) == 0)
             break;
         index++;
     }
-    if (index >= algorithm_maxindex)
+    if (index >= __L4AG_OPS_MAX)
         return -1;
 
     return l4agctl_setalgorithm_cmd(argv[0], index);
