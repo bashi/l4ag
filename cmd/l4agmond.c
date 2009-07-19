@@ -54,17 +54,15 @@ static int get_priority(char *dev)
 void l4agmon_addr_assigned(struct l4agmon *lm, char *dev, struct in_addr *addr)
 {
     int err, pri;
+
     printf("creating connection associated, local addr %s ...\n",
            inet_ntoa(*addr));
-    /* XXX sleep 5 seconds to wait for stabilize lower layer stabilization. */
-    sleep(5);
 
     err = l4agctl_setpeer_cmd(lm->ifname, &lm->paddr, dev);
     if (err < 0) {
         fprintf(stderr, "Can't set peer.\n");
         return;
     }
-
     /* set priority */
     pri = get_priority(dev);
     l4agctl_setpri_cmd(lm->ifname, pri);
@@ -204,6 +202,113 @@ static void print_rtattr_ifa(char *prefix, struct rtattr *rta)
     printf("\n");
 }
 
+static void print_rtmsg(char *prefix, struct l4agmon *lm, struct nlmsghdr *rnh, struct rtmsg *rtm) __attribute__((unused));
+static void print_rtmsg(char *prefix, struct l4agmon *lm, struct nlmsghdr *rnh, struct rtmsg *rtm)
+{
+    static char *rtatypes[] = {
+        "RTA_UNSPEC",
+        "RTA_DST",
+        "RTA_SRC",
+        "RTA_IIF",
+        "RTA_OIF",
+        "RTA_GATEWAY",
+        "RTA_PRIORITY",
+        "RTA_PREFSRC",
+        "RTA_METRICS",
+        "RTA_MULTIPATH",
+        "RTA_PROTOINFO", /* no longer used */
+        "RTA_FLOW",
+        "RTA_CACHEINFO",
+        "RTA_SESSION", /* no longer used */
+        "RTA_MP_ALGO", /* no longer used */
+        "RTA_TABLE",
+        "__RTA_MAX"
+    };
+    char *rtmtypes[] = {
+        "RTN_UNSPEC",
+        "RTN_UNICAST",		/* Gateway or direct route	*/
+        "RTN_LOCAL",		/* Accept locally		*/
+        "RTN_BROADCAST",		/* Accept locally as broadcast,
+                               send as broadcast */
+        "RTN_ANYCAST",		/* Accept locally as broadcast,
+                               but send as unicast */
+        "RTN_MULTICAST",		/* Multicast route		*/
+        "RTN_BLACKHOLE",		/* Drop				*/
+        "RTN_UNREACHABLE",	/* Destination is unreachable   */
+        "RTN_PROHIBIT",		/* Administratively prohibited	*/
+        "RTN_THROW",		/* Not in this table		*/
+        "RTN_NAT",		/* Translate this address	*/
+        "RTN_XRESOLVE",		/* Use external resolver	*/
+        "__RTN_MAX "
+    };
+    char *family, *scope, *type, *table;
+    char ifname[IFNAMSIZ];
+    struct rtattr *rta;
+
+    family = scope = type = table = "N/A";
+
+    switch (rtm->rtm_family) {
+    case AF_LOCAL: family = "local"; break;
+    case AF_INET: family = "inet"; break;
+    case AF_INET6: family = "inet6"; break;
+    default: break;
+    }
+
+    if (rtm->rtm_type < __RTN_MAX)
+        type = rtmtypes[rtm->rtm_type];
+
+    switch (rtm->rtm_scope) {
+    case RT_SCOPE_UNIVERSE: scope = "global"; break;
+    case RT_SCOPE_SITE: scope = "site"; break;
+    case RT_SCOPE_LINK: scope = "link"; break;
+    case RT_SCOPE_HOST: scope = "host"; break;
+    default: break;
+    }
+
+    switch (rtm->rtm_table) {
+    case RT_TABLE_UNSPEC: table = "unspec"; break;
+    case RT_TABLE_COMPAT: table = "compat"; break;
+    case RT_TABLE_MAIN: table = "main"; break;
+    case RT_TABLE_LOCAL: table = "local"; break;
+    default: break;
+    }
+
+    printf("%s(family=%s,scope=%s,type=%s,table=%s)\n",
+           prefix, family, scope, type, table);
+    rta = (struct rtattr *)((char *)NLMSG_DATA(rnh)
+                            + NLMSG_ALIGN(sizeof(*rtm)));
+    for (; RTA_OK(rta, rnh->nlmsg_len);
+         rta = RTA_NEXT(rta, rnh->nlmsg_len)) {
+        if (rta->rta_type > __RTA_MAX)
+            continue;
+        printf("  rtattr: type=%s", rtatypes[rta->rta_type]);
+        if (rtm->rtm_family != AF_INET)
+            continue;
+        switch (rta->rta_type) {
+        case RTA_DST:
+            printf(", dst=%s", inet_ntoa(*(struct in_addr*)RTA_DATA(rta)));
+            break;
+        case RTA_SRC:
+            printf(", src=%s", inet_ntoa(*(struct in_addr*)RTA_DATA(rta)));
+            break;
+        case RTA_GATEWAY:
+            printf(", gateway=%s", inet_ntoa(*(struct in_addr*)RTA_DATA(rta)));
+            break;
+        case RTA_IIF:
+            getifnamebyindex(*(int *)RTA_DATA(rta), ifname);
+            printf(", input if=%s", ifname);
+            break;
+        case RTA_OIF:
+            getifnamebyindex(*(int *)RTA_DATA(rta), ifname);
+            printf(", output if=%s", ifname);
+            break;
+        default:
+            break;
+        }
+        printf("\n");
+    }
+}
+
 int nlmsg_newaddr_handler(struct nlinfo *nli, struct nlmsghdr *rnh)
 {
     char ifname[IFNAMSIZ];
@@ -224,7 +329,6 @@ int nlmsg_newaddr_handler(struct nlinfo *nli, struct nlmsghdr *rnh)
         //print_rtattr_ifa("  attr: ", rta);
         if (rta->rta_type == IFA_LOCAL) {   /* address assigned on this if. */
             addr = (struct in_addr *)RTA_DATA(rta);
-            printf("  addr: %s\n", inet_ntoa(*addr));
             l4agmon_addr_assigned(&nli->lm, ifname, addr);
         }
     }
@@ -251,7 +355,6 @@ int nlmsg_deladdr_handler(struct nlinfo *nli, struct nlmsghdr *rnh)
         //print_rtattr_ifa("  attr: ", rta);
         if (rta->rta_type == IFA_LOCAL) {   /* address deleted on this if. */
             addr = (struct in_addr *)RTA_DATA(rta);
-            printf("  addr: %s\n", inet_ntoa(*addr));
             l4agmon_addr_deleted(&nli->lm, ifname, addr);
         }
     }
@@ -261,16 +364,14 @@ int nlmsg_deladdr_handler(struct nlinfo *nli, struct nlmsghdr *rnh)
 int nlmsg_newroute_handler(struct nlinfo *nli, struct nlmsghdr *rnh)
 {
     struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(rnh);
-    printf("route added, type: %d, proto: %d, scope: %d\n",
-           (int)rtm->rtm_type, (int)rtm->rtm_protocol, (int)rtm->rtm_scope);
+    print_rtmsg("route added, ", &nli->lm, rnh, rtm);
     return 0;
 }
 
 int nlmsg_delroute_handler(struct nlinfo *nli, struct nlmsghdr *rnh)
 {
     struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(rnh);
-    printf("route deleted, type: %d, proto: %d, scope: %d\n",
-           (int)rtm->rtm_type, (int)rtm->rtm_protocol, (int)rtm->rtm_scope);
+    print_rtmsg("route deleted, ", &nli->lm, rnh, rtm);
     return 0;
 }
 
@@ -383,6 +484,7 @@ int main(int argc, char **argv)
 
     strncpy(nli.lm.ifname, argv[1], IFNAMSIZ);
     /* XXX should support hostname */
+    nli.lm.paddr.sin_family = AF_INET;
     nli.lm.paddr.sin_addr.s_addr = inet_addr(argv[2]);
     nli.lm.paddr.sin_port = htons(L4AG_DEFAULTPORT);
     printf("if = %s, addr = %s\n", nli.lm.ifname,

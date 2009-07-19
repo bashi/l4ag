@@ -331,12 +331,14 @@ static void l4ag_delete_l4conn(struct l4ag_struct *ln, struct l4conn *lc)
     if (lc->recv_sock) {
         DBG(KERN_INFO "l4ag: shutting down recvsock...\n");
         ln->ops->delete_recvsocket(ln, lc);
+        tcp_disconnect(lc->send_sock->sk, 0);
         kernel_sock_shutdown(lc->recv_sock, SHUT_RDWR);
         /* lc->recv_sock will set to NULL when recv thread terminates. */
     }
     if (lc->send_sock) {
         DBG(KERN_INFO "l4ag: shutting down sendsock...\n");
         ln->ops->delete_sendsocket(ln, lc);
+        tcp_disconnect(lc->send_sock->sk, 0);
         kernel_sock_shutdown(lc->send_sock, SHUT_RDWR);
         sock_release(lc->send_sock);
         lc->send_sock = NULL;
