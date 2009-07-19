@@ -38,7 +38,7 @@
 static int debug = 1;
 
 /* uncomment this to debug. */
-#define DEBUG 1
+//#define DEBUG 1
 
 #ifdef DEBUG
 # define DBG if(debug)printk
@@ -58,26 +58,31 @@ static const struct ethtool_ops l4ag_ethtool_ops;
 
 static int l4agctl_send_delpeer_msg(struct l4conn *);
 
-static void l4ag_inaddr_dbgprint(char *prefix, struct in_addr *addr)
+static inline void l4ag_inaddr_dbgprint(char *prefix, struct in_addr *addr)
 {
+#ifdef DEBUG
     __u32 haddr = ntohl(addr->s_addr);
-    printk(KERN_INFO "%s%d.%d.%d.%d\n", prefix,
-           (haddr >> 24), ((haddr >> 16)&0xff), ((haddr >> 8)&0xff),
-           (haddr & 0xff));
+    DBG(KERN_INFO "%s%d.%d.%d.%d\n", prefix,
+        (haddr >> 24), ((haddr >> 16)&0xff), ((haddr >> 8)&0xff),
+        (haddr & 0xff));
+#endif
 }
 
-static void l4ag_sockaddr_dbgprint(char *prefix, struct sockaddr *addr)
+static inline void l4ag_sockaddr_dbgprint(char *prefix, struct sockaddr *addr)
 {
+#ifdef DEBUG
     __u32 haddr = ntohl(((struct sockaddr_in*)addr)->sin_addr.s_addr);
     __u16 hport = ntohs(((struct sockaddr_in*)addr)->sin_port);
 
-    printk(KERN_INFO "%s%d.%d.%d.%d:%d\n", prefix,
-           (haddr >> 24), ((haddr >> 16)&0xff), ((haddr >> 8)&0xff),
-           (haddr & 0xff), hport);
+    DBG(KERN_INFO "%s%d.%d.%d.%d:%d\n", prefix,
+        (haddr >> 24), ((haddr >> 16)&0xff), ((haddr >> 8)&0xff),
+        (haddr & 0xff), hport);
+#endif
 }
 
-static void l4ag_sock_dbgprint(struct socket *sock)
+static inline void l4ag_sock_dbgprint(struct socket *sock)
 {
+#ifdef DEBUG
     struct sockaddr_in addr;
     int err, addrlen = sizeof(addr);
 
@@ -89,6 +94,7 @@ static void l4ag_sock_dbgprint(struct socket *sock)
     if (err < 0)
         return;
     l4ag_sockaddr_dbgprint("  remote: ", (struct sockaddr*)&addr);
+#endif
 }
 
 /* socket operations */
