@@ -24,6 +24,8 @@
 #include <linux/nsproxy.h>
 #include <linux/in.h>
 #include <linux/tcp.h>
+#include <net/sock.h>
+#include <net/inet_common.h>
 #include <net/tcp.h>
 #include <net/net_namespace.h>
 #include <net/netns/generic.h>
@@ -119,6 +121,227 @@ static int l4ag_sendsock(struct socket *sock, unsigned char *buf,
     DBG(KERN_INFO "l4ag: kernel_sendmsg returns %d\n", len);
     return len;
 }
+
+/*
+ * Socket layer implementation.
+ * Take over socket operations of a socket which send/recv packets
+ * through the virtual interface to optimize the performance by avoiding
+ * L4 over L4 tunnel transmission.
+ */
+
+struct l4ag_sock {
+    struct tcp_sock tcp_sk;
+    struct sock *original_sk;
+    const struct proto_ops *original_ops;
+};
+
+static inline struct l4ag_sock *l4ag_sk(const struct sock *sk)
+{
+    return (struct l4ag_sock *)sk;
+}
+
+/* Protocol operations.
+ * Most of these act as a proxy of inet_stream_ops.
+ * We will remove these just-a-proxy-function after we become
+ * familiar with how socket operations are called and worked.
+ */
+static int l4ag_proto_release(struct socket *sock)
+{
+    //struct l4ag_sock *l4sk = l4ag_sk(sock->sk);
+    DBG(KERN_INFO "l4ag: proto_release called.\n");
+    return inet_stream_ops.release(sock);
+}
+
+static int l4ag_proto_bind(struct socket *sock, struct sockaddr *uaddr,
+                           int addr_len)
+{
+    //struct l4ag_sock *l4sk = l4ag_sk(sock->sk);
+    DBG(KERN_INFO "l4ag: proto_bind called.\n");
+    return inet_stream_ops.bind(sock, uaddr, addr_len);
+}
+
+static int l4ag_proto_connect(struct socket *sock, struct sockaddr *uaddr,
+                              int addr_len, int flags)
+{
+    //struct l4ag_sock *l4sk = l4ag_sk(sock->sk);
+    DBG(KERN_INFO "l4ag: proto_connect called.\n");
+    return inet_stream_ops.connect(sock, uaddr, addr_len, flags);
+}
+
+static int l4ag_proto_accept(struct socket *sock, struct socket *newsock,
+                             int flags)
+{
+    //struct l4ag_sock *l4sk = l4ag_sk(sock->sk);
+    DBG(KERN_INFO "l4ag: proto_accept called.\n");
+    return inet_stream_ops.accept(sock, newsock, flags);
+}
+
+static int l4ag_proto_getname(struct socket *sock, struct sockaddr *uaddr,
+                              int *uaddr_len, int peer)
+{
+    //struct l4ag_sock *l4sk = l4ag_sk(sock->sk);
+    DBG(KERN_INFO "l4ag: proto_getname called.\n");
+    return inet_stream_ops.getname(sock, uaddr, uaddr_len, peer);
+}
+
+static unsigned int l4ag_proto_poll(struct file *file, struct socket *sock,
+                           poll_table *wait)
+{
+    //struct l4ag_sock *l4sk = l4ag_sk(sock->sk);
+    DBG(KERN_INFO "l4ag: proto_poll called.\n");
+    return inet_stream_ops.poll(file, sock, wait);
+}
+
+static int l4ag_proto_ioctl(struct socket *sock, unsigned int cmd,
+                            unsigned long arg)
+{
+    //struct l4ag_sock *l4sk = l4ag_sk(sock->sk);
+    DBG(KERN_INFO "l4ag: proto_ioctl called.\n");
+    return inet_stream_ops.ioctl(sock, cmd, arg);
+}
+
+static int l4ag_proto_listen(struct socket *sock, int backlog)
+{
+    //struct l4ag_sock *l4sk = l4ag_sk(sock->sk);
+    DBG(KERN_INFO "l4ag: proto_listen called.\n");
+    return inet_stream_ops.listen(sock, backlog);
+}
+
+static int l4ag_proto_shutdown(struct socket *sock, int how)
+{
+    //struct l4ag_sock *l4sk = l4ag_sk(sock->sk);
+    DBG(KERN_INFO "l4ag: proto_shutdown called.\n");
+    return inet_stream_ops.shutdown(sock, how);
+}
+
+static int l4ag_proto_setsockopt(struct socket *sock, int level, int optname,
+                                 char __user *optval, int optlen)
+{
+    //struct l4ag_sock *l4sk = l4ag_sk(sock->sk);
+    /* XXX we need to implement this function to adapt l4ag. */
+    DBG(KERN_INFO "l4ag: proto_setsockopt called.\n");
+    return inet_stream_ops.setsockopt(sock, level, optname, optval, optlen);
+}
+
+static int l4ag_proto_getsockopt(struct socket *sock, int level, int optname,
+                                 char __user *optval, int __user *optlen)
+{
+    //struct l4ag_sock *l4sk = l4ag_sk(sock->sk);
+    /* XXX we need to implement this function to adapt l4ag. */
+    DBG(KERN_INFO "l4ag: proto_getsockopt called.\n");
+    return inet_stream_ops.getsockopt(sock, level, optname, optval, optlen);
+}
+
+static int l4ag_proto_sendmsg(struct kiocb *iocb, struct socket *sock,
+                              struct msghdr *msg, size_t size)
+{
+    //struct l4ag_sock *l4sk = l4ag_sk(sock->sk);
+    /* XXX we need to implement this function to adapt l4ag. */
+    DBG(KERN_INFO "l4ag: proto_sendmsg called\n");
+    return inet_stream_ops.sendmsg(iocb, sock, msg, size);
+}
+
+static int l4ag_proto_recvmsg(struct kiocb *iocb, struct socket *sock,
+                              struct msghdr *msg, size_t size, int flags)
+{
+    //struct l4ag_sock *l4sk = l4ag_sk(sock->sk);
+    DBG(KERN_INFO "l4ag: proto_recvmsg called.\n");
+    return inet_stream_ops.recvmsg(iocb, sock, msg, size, flags);
+}
+
+static ssize_t l4ag_proto_sendpage(struct socket *sock, struct page *page,
+                                   int offset, size_t size, int flags)
+{
+    //struct l4ag_sock *l4sk = l4ag_sk(sock->sk);
+    DBG(KERN_INFO "l4ag: proto_sendpage called.\n");
+    return inet_stream_ops.sendpage(sock, page, offset, size, flags);
+}
+
+static ssize_t l4ag_proto_splice_read(struct socket *sock, loff_t *ppos,
+                                      struct pipe_inode_info *pipe, size_t len,
+                                      unsigned int flags)
+{
+    //struct l4ag_sock *l4sk = l4ag_sk(sock->sk);
+    DBG(KERN_INFO "l4ag: proto_splice_read called.\n");
+    return inet_stream_ops.splice_read(sock, ppos, pipe, len, flags);
+}
+
+const static struct proto_ops inet_l4ag_ops = {
+    .family = PF_INET,
+    .owner = THIS_MODULE,
+    .release = l4ag_proto_release,
+    .bind = l4ag_proto_bind,
+    .connect = l4ag_proto_connect,
+    .socketpair = sock_no_socketpair,
+    .accept = l4ag_proto_accept,
+    .getname = l4ag_proto_getname,
+    .poll = l4ag_proto_poll,
+    .ioctl = l4ag_proto_ioctl,
+    .listen = l4ag_proto_listen,
+    .shutdown = l4ag_proto_shutdown,
+    .setsockopt = l4ag_proto_setsockopt,
+    .getsockopt = l4ag_proto_getsockopt,
+    .sendmsg = l4ag_proto_sendmsg,
+    .recvmsg = l4ag_proto_recvmsg,
+    .mmap = sock_no_mmap,
+    .sendpage = l4ag_proto_sendpage,
+    .splice_read = l4ag_proto_splice_read,
+#ifdef CONFIG_COMPAT
+    .compat_setsockopt = compat_sock_common_setsockopt,
+    .compat_getsockopt = compat_sock_common_getsockopt,
+#endif
+};
+
+/* a copy of tcp_prot, but member 'slab' set to NULL. */
+struct proto l4ag_prot;
+
+static inline int l4agsk_is_l4agsocket(struct socket *sock)
+{
+    return sock->ops == &inet_l4ag_ops;
+}
+
+static int l4agsk_takeover_sock(struct socket *sock)
+{
+    //struct sock *sk = sock->sk;
+    //struct l4ag_sock *l4sk;
+
+    /* take over proto ops */
+    sock->ops = &inet_l4ag_ops;
+    return 0;
+#if 0
+    /* support TCP only for now */
+    if (sk->sk_protocol != IPPROTO_TCP)
+        return -EINVAL;
+
+    l4sk = kmalloc(sizeof(*l4sk), GFP_KERNEL | GFP_ATOMIC);
+    if (!l4sk)
+        return -ENOMEM;
+
+    DBG(KERN_INFO "obj_size = %d, sizeof(tcp_sock) = %d\n",
+        sk->sk_prot->obj_size, sizeof(struct tcp_sock));
+    memcpy(&l4sk->tcp_sk, sk, sk->sk_prot->obj_size);
+    /* take over original proto ops */
+    DBG(KERN_INFO "l4ag: trying to set ops.\n");
+    l4sk->original_sk = sk;
+    l4sk->original_ops = sock->ops;
+    sock->ops = &inet_l4ag_ops;
+
+    /* XXX Destroy current sock, but I'm not sure this is the proper way... */
+    //sock_put(sk);
+
+    sock->sk = (struct sock *)l4sk;
+    /* We can't change sk->sk_prot->obj_size because proto_ops is shared. */
+    /* sock->sk->sk_prot->obj_size = sizeof(struct l4ag_sock); */
+
+    /* XXX workaround to avoid memory leak. */
+    sock->sk->sk_prot_creator = &l4ag_prot;
+    return 0;
+#endif
+}
+
+/*
+ * Net device implementation.
+ */
 
 /* Net device open. */
 static int l4ag_net_open(struct net_device *dev)
@@ -790,7 +1013,7 @@ static int l4ag_recvpacket_generic(struct l4ag_struct *ln, struct l4conn *lc)
             goto out_partial;
 
         pktlen = ntohs(iph->tot_len);
-        if (pktlen > lc->recvlen) 
+        if (pktlen > lc->recvlen)
             goto out_partial;
 
         DBG(KERN_INFO "l4ag: pktlen = %d\n", pktlen);
@@ -986,7 +1209,7 @@ static int l4ag_sendpacket_ab(struct l4ag_struct *ln)
     struct sk_buff *skb;
     struct l4ag_ab_info *abinfo = ln->ops->private_data;
     struct socket *send_sock;
-    int len;
+    int len, err;
 
     if (!abinfo->primary_lc) {
         DBG(KERN_INFO "l4ag: no l4 connection.\n");
@@ -1003,6 +1226,24 @@ static int l4ag_sendpacket_ab(struct l4ag_struct *ln)
     l4ag_sock_dbgprint(send_sock);
 
     while ((skb = skb_dequeue(&ln->sendq))) {
+        /* Take over the socket operations, just for test now. */
+        if ((skb->sk && skb->sk->sk_socket) &&
+            !l4agsk_is_l4agsocket(skb->sk->sk_socket)) {
+            if ((skb->sk->sk_family == AF_INET) &&
+                (skb->sk->sk_protocol == IPPROTO_TCP) &&
+                (skb->sk->sk_state == TCP_ESTABLISHED)) {
+                lock_sock(skb->sk);
+                DBG(KERN_INFO "l4ag: trying to take over the socket ops.\n");
+                err = l4agsk_takeover_sock(skb->sk->sk_socket);
+                if (err < 0) {
+                    DBG(KERN_INFO "l4ag: Can't take over the socket ops.\n");
+                } else {
+                    DBG(KERN_INFO "l4ag: socket operation overrided.\n");
+                }
+                release_sock(skb->sk);
+            }
+        }
+
 retry:
         len = l4ag_sendsock(send_sock, skb->data, skb->len, 0);
         if (len < 0) {
@@ -1034,7 +1275,6 @@ static struct l4ag_operations __attribute__((unused)) l4ag_ab_ops = {
     .sendpacket = l4ag_sendpacket_ab,
     .private_data = NULL
 };
-
 
 /* Roundrobin recv/send algorithm */
 
@@ -1879,6 +2119,10 @@ static int __init l4ag_init(void)
         printk(KERN_ERR "l4ag: Can't register pernet ops\n");
         goto err_misc;
     }
+
+    memcpy(&l4ag_prot, &tcp_prot, sizeof(l4ag_prot));
+    l4ag_prot.slab = NULL;
+
     return 0;
 err_misc:
     unregister_pernet_gen_device(l4ag_net_id, &l4ag_net_ops);
