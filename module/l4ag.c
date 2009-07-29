@@ -26,6 +26,7 @@
 #include <linux/tcp.h>
 #include <net/sock.h>
 #include <net/inet_common.h>
+#include <net/inet_hashtables.h>
 #include <net/tcp.h>
 #include <net/net_namespace.h>
 #include <net/netns/generic.h>
@@ -42,6 +43,8 @@ static int debug = 1;
 /* uncomment this to debug. */
 #define DEBUG 1
 
+#define L4AG_TCP_DIRECT 1
+
 #ifdef DEBUG
 # define DBG if(debug)printk
 #else
@@ -55,6 +58,8 @@ static unsigned int l4ag_net_id;
 struct l4ag_net {
     struct list_head dev_list;
 };
+
+static struct l4ag_struct *default_ln = NULL;   /* XXX just for test */
 
 static const struct ethtool_ops l4ag_ethtool_ops;
 
@@ -135,6 +140,38 @@ struct l4ag_sock {
     const struct proto_ops *original_ops;
 };
 
+struct l4aghdr {
+    __u8 magic;
+    __u8 reserved1;
+    __be16 paylen;
+    __be32 seq;
+    __be32 saddr;
+    __be16 sport;
+    __be32 daddr;
+    __be16 dport;
+} __attribute__((packed));
+
+#define L4AGHDRMAGIC 0x20
+#define L4AG_MAXPAYLOAD 0xffff
+
+static inline void l4ag_l4agpkt_dbgprint(struct l4aghdr *l4h)
+{
+#ifdef DEBUG
+    __u32 saddr = ntohl(l4h->saddr);
+    __u32 daddr = ntohl(l4h->daddr);
+    __u16 sport = ntohs(l4h->sport);
+    __u16 dport = ntohs(l4h->dport);
+    DBG(KERN_INFO "  src: %d.%d.%d.%d:%d\n",
+        (saddr >> 24), ((saddr >> 16)&0xff), ((saddr >> 8)&0xff),
+        (saddr & 0xff), sport);
+    DBG(KERN_INFO "  dst: %d.%d.%d.%d:%d\n",
+        (daddr >> 24), ((daddr >> 16)&0xff), ((daddr >> 8)&0xff),
+        (daddr & 0xff), dport);
+#endif
+}
+
+static int l4agsk_takeover_sock(struct socket *sock);
+
 static inline struct l4ag_sock *l4ag_sk(const struct sock *sk)
 {
     return (struct l4ag_sock *)sk;
@@ -171,9 +208,15 @@ static int l4ag_proto_connect(struct socket *sock, struct sockaddr *uaddr,
 static int l4ag_proto_accept(struct socket *sock, struct socket *newsock,
                              int flags)
 {
+    int err;
     //struct l4ag_sock *l4sk = l4ag_sk(sock->sk);
     DBG(KERN_INFO "l4ag: proto_accept called.\n");
-    return inet_stream_ops.accept(sock, newsock, flags);
+    err = inet_stream_ops.accept(sock, newsock, flags);
+    if (!err) {
+        DBG(KERN_INFO "l4agsk: take over accepted sock ops.\n");
+        l4agsk_takeover_sock(newsock);
+    }
+    return err;
 }
 
 static int l4ag_proto_getname(struct socket *sock, struct sockaddr *uaddr,
@@ -189,7 +232,10 @@ static unsigned int l4ag_proto_poll(struct file *file, struct socket *sock,
 {
     //struct l4ag_sock *l4sk = l4ag_sk(sock->sk);
     DBG(KERN_INFO "l4ag: proto_poll called.\n");
-    return inet_stream_ops.poll(file, sock, wait);
+    if (sock->sk->sk_state == TCP_ESTABLISHED)
+        return datagram_poll(file, sock, wait);
+    else
+        return inet_stream_ops.poll(file, sock, wait);
 }
 
 static int l4ag_proto_ioctl(struct socket *sock, unsigned int cmd,
@@ -235,18 +281,144 @@ static int l4ag_proto_getsockopt(struct socket *sock, int level, int optname,
 static int l4ag_proto_sendmsg(struct kiocb *iocb, struct socket *sock,
                               struct msghdr *msg, size_t size)
 {
+#ifdef L4AG_TCP_DIRECT
+    struct sock *sk = sock->sk;
+    struct l4aghdr l4h;
+    struct sk_buff *skb;
+    struct inet_sock *isk = inet_sk(sock->sk);
+    struct iovec *iov;
+    int iovlen, totlen = 0, err, paylen, seglen;
+    long timeo;
+    char *data;
+
+    DBG(KERN_INFO "l4agsk: TCP direct send, state = %d\n", sk->sk_state);
+
+    lock_sock(sk);
+    /* Wait for a connection to finish. */
+    timeo = sock_sndtimeo(sk, msg->msg_flags & MSG_DONTWAIT);
+    if ((1 << sk->sk_state) & ~(TCPF_ESTABLISHED | TCPF_CLOSE_WAIT)) {
+        DBG(KERN_INFO "l4agsk: wait for connection establish..\n");
+        if ((err = sk_stream_wait_connect(sk, &timeo)) != 0)
+            goto out_err;
+        DBG(KERN_INFO "l4agsk: connection established, going to send.\n");
+    }
+
+    l4h.magic = L4AGHDRMAGIC;
+    l4h.reserved1 = 0;
+    l4h.paylen = 0;
+    l4h.seq = 0;    // XXX
+    l4h.saddr = isk->saddr;
+    l4h.sport = isk->sport;
+    l4h.daddr = isk->daddr;
+    l4h.dport = isk->dport;
+
+    iovlen = msg->msg_iovlen;
+    iov = msg->msg_iov;
+
+    /* XXX we may improve the performance of transmssion... */
+    while (--iovlen >= 0) {
+        data = iov->iov_base;
+try_again:
+        paylen = iov->iov_len;
+        if (paylen > L4AG_MAXPAYLOAD)
+            paylen = L4AG_MAXPAYLOAD;
+        seglen = paylen + sizeof(l4h);
+        if (!(skb = alloc_skb(seglen, GFP_KERNEL))) {
+            DBG(KERN_INFO "l4agsk: can't allocate skb.\n");
+            goto drop;
+        }
+        l4h.paylen = htons(paylen);
+        skb_copy_to_linear_data(skb, &l4h, sizeof(l4h));
+        DBG(KERN_INFO "l4agsk: payload len=%d, data:\n", paylen);
+        copy_from_user(skb->data + sizeof(l4h), data, paylen);
+        DBG(KERN_INFO "  %x %x %x %x ...\n",
+            data[0], data[1], data[2], data[3]);
+        skb_put(skb, seglen);
+        skb->ip_summed = CHECKSUM_UNNECESSARY;
+        skb_reset_mac_header(skb);
+        skb->protocol = AF_INET;
+        DBG(KERN_INFO "l4agsk: created skb, len = %d, hdr:\n", skb->len);
+        l4ag_l4agpkt_dbgprint((struct l4aghdr *)skb->data);
+        /* XXX should support flags, especially non blocking I/O. */
+        skb_queue_tail(&default_ln->sendq, skb);
+        totlen += paylen;
+        if (paylen < iov->iov_len) {
+            iov->iov_len -= paylen;
+            data = data + paylen;
+            goto try_again;
+        }
+        iov++;
+    }
+    release_sock(sk);
+    complete(&default_ln->sendq_comp);
+    DBG(KERN_INFO "l4agsk: proto_sendmsg done.\n");
+    return totlen;
+drop:
+    release_sock(sk);
+    DBG(KERN_INFO "l4agsk: drop send data.\n");
+    return totlen;
+out_err:
+    release_sock(sk);
+    err = sk_stream_error(sk, msg->msg_flags, err);
+    return err;
+#else
     //struct l4ag_sock *l4sk = l4ag_sk(sock->sk);
-    /* XXX we need to implement this function to adapt l4ag. */
     DBG(KERN_INFO "l4ag: proto_sendmsg called\n");
     return inet_stream_ops.sendmsg(iocb, sock, msg, size);
+#endif
 }
 
 static int l4ag_proto_recvmsg(struct kiocb *iocb, struct socket *sock,
                               struct msghdr *msg, size_t size, int flags)
 {
+#ifdef L4AG_TCP_DIRECT
+    struct sock *sk = sock->sk;
+    struct iovec *iov;
+    struct sk_buff *skb;
+    int peeked, len, err = 0;
+    //unsigned long cpu_flags;
+
+    DBG(KERN_INFO "l4agsk: proto_recvmsg called, wait for data.\n");
+    skb = __skb_recv_datagram(sk, flags, &peeked, &err);
+    if (!skb) {
+        DBG(KERN_INFO "l4agsk: recvmsg failed with skb == NULL.\n");
+        goto out;
+    }
+
+    DBG(KERN_INFO "l4agsk: skb received, len = %d\n", skb->len);
+
+    /* XXX support multiple iov */
+    iov = msg->msg_iov;
+    len = iov->iov_len;
+    DBG(KERN_INFO "l4agsk: iovlen = %d\n", iov->iov_len);
+    if (len > skb->len)
+        len = skb->len;
+    err = skb_copy_datagram_iovec(skb, 0, iov, len);
+    if (err) {
+        DBG(KERN_INFO "l4agsk: recvmsg failed with !skb_copy_datagram_iovec.\n");
+        kfree_skb(skb);
+        goto out;
+    }
+    DBG(KERN_INFO "l4agsk: data received, len = %d\n", len);
+    err = len;
+    if (len < skb->len) {
+        DBG(KERN_INFO "l4agsk: partial read, pull up.\n");
+        skb_pull(skb, len); // XXX
+        skb_queue_head(&sk->sk_receive_queue, skb);
+    } else {
+        DBG(KERN_INFO "l4agsk: remove skb from recv queue.\n");
+        lock_sock(sk);
+        kfree_skb(skb);
+        sk_mem_reclaim(sk);
+        release_sock(sk);
+    }
+out:
+    return err;
+#else
     //struct l4ag_sock *l4sk = l4ag_sk(sock->sk);
     DBG(KERN_INFO "l4ag: proto_recvmsg called.\n");
     return inet_stream_ops.recvmsg(iocb, sock, msg, size, flags);
+#endif
 }
 
 static ssize_t l4ag_proto_sendpage(struct socket *sock, struct page *page,
@@ -338,6 +510,167 @@ static int l4agsk_takeover_sock(struct socket *sock)
     return 0;
 #endif
 }
+
+static inline struct sock *l4agsk_lookup_destsk(struct l4ag_struct *ln,
+                                                struct l4aghdr *lh)
+{
+    return inet_lookup(dev_net(ln->dev), &tcp_hashinfo, lh->saddr, lh->sport,
+                       lh->daddr, lh->dport, ln->dev->ifindex);
+}
+
+#if 0
+static struct sock *l4agsk_lookup_acceptedsk(struct l4ag_struct *ln,
+                                             struct l4aghdr *lh)
+{
+    struct inet_connection_sock *icsk;
+    struct request_sock *req;
+    struct sock *sk, *ask = NULL;
+    sk = inet_lookup_listener(dev_net(ln->dev), &tcp_hashinfo, INADDR_ANY,
+                              lh->dport, ln->dev->ifindex);
+    if (!sk) {
+        DBG(KERN_INFO "l4agsk: couldn't find listener socket.\n");
+        return NULL;
+    }
+    icsk = inet_csk(sk);
+    lock_sock(sk);
+    if (reqsk_queue_empty(&icsk->icsk_accept_queue)) {
+        DBG(KERN_INFO "l4agsk: accept queue empty.\n");
+        goto out;
+    }
+    req = icsk->icsk_accept_queue.rskq_accept_head;
+    if (!req)
+        goto out;
+    ask = req->sk;
+    if (!ask)
+        goto out;
+    WARN_ON(ask->sk_state == TCP_SYN_RECV);
+out:
+    release_sock(sk);
+    return ask;
+}
+#endif
+
+#ifdef L4AG_TCP_DIRECT
+static void l4agsk_set_pending_skb(struct l4ag_struct *ln,
+                                   struct sk_buff *skb)
+{
+    /* XXX should be locked */
+    ln->pending_skb = skb;
+}
+
+static struct sk_buff *l4agsk_get_pending_skb(struct l4ag_struct *ln)
+{
+    struct sk_buff *skb = ln->pending_skb;
+    ln->pending_skb = NULL;
+    return skb;
+}
+
+static int l4agsk_is_pending_skb(struct l4ag_struct *ln)
+{
+    return ln->pending_skb != NULL;
+}
+
+static int l4agsk_recvpacket(struct l4ag_struct *ln, struct l4conn *lc)
+{
+    struct l4aghdr *l4h;
+    struct sock *sk;
+    struct sk_buff *skb;
+    int paylen, seglen, copied, err;
+
+    DBG(KERN_INFO "l4agsk: TCP direct packet received, len = %d\n",
+        lc->recvlen);
+
+    /* look up pending skb */
+    skb = l4agsk_get_pending_skb(ln);
+    if (skb) {
+        DBG(KERN_INFO "l4agsk: pending skb found.\n");
+        l4h = (struct l4aghdr *)skb->data;
+        paylen = ntohs(l4h->paylen);
+        seglen = paylen + sizeof(*l4h);
+    } else {
+        /* There is no pending skb, create new skb */
+        if (lc->recvlen < sizeof(struct l4aghdr)) {
+            DBG(KERN_INFO "l4agsk: too short data.\n");
+            l4cb_reset(lc);
+            err = -EINVAL;
+            goto drop;
+        }
+        l4h = (struct l4aghdr *)lc->recvdata;
+        if (l4h->magic != L4AGHDRMAGIC) {
+            DBG(KERN_INFO "l4agsk: invalid header.\n");
+            l4cb_reset(lc);
+            err = -EINVAL;
+            goto drop;
+        }
+        paylen = ntohs(l4h->paylen);
+        seglen = paylen + sizeof(*l4h);
+        DBG(KERN_INFO "l4agsk: creating recv skb, seglen = %d\n", seglen);
+        if (!(skb = alloc_skb(seglen, GFP_KERNEL))) {
+            DBG(KERN_INFO "l4agsk: can't allocate skb.\n");
+            if (lc->recvlen > seglen)
+                l4cb_pull(lc, seglen);
+            else
+                l4cb_reset(lc);
+            err = -ENOMEM;
+            goto drop;
+        }
+        skb->ip_summed = CHECKSUM_UNNECESSARY;
+        skb_reset_mac_header(skb);
+        skb->protocol = AF_INET;
+    }
+    copied = seglen - skb->len;
+    if (copied > lc->recvlen)
+        copied = lc->recvlen;
+    DBG(KERN_INFO "l4agsk: copied = %d\n", copied);
+    skb_copy_to_linear_data_offset(skb, skb->len, lc->recvdata, copied);
+    skb_put(skb, copied);
+    l4cb_pull(lc, copied);
+    WARN_ON(skb->len > seglen);
+    if (skb->len < seglen) {
+        DBG(KERN_INFO "l4agsk: partial l4ag segment, pending skb.\n");
+        l4agsk_set_pending_skb(ln, skb);
+        WARN_ON(lc->recvlen != 0);
+        goto out;
+    }
+
+    /* look up destination socket */
+    DBG(KERN_INFO "l4agsk: l4ag segment received, lookup destination:\n");
+    l4ag_l4agpkt_dbgprint(l4h);
+    sk = l4agsk_lookup_destsk(ln, l4h);
+#if 0
+    if (!sk) {
+        DBG(KERN_INFO "l4agsk: trying to lookup in accept queue...\n");
+        sk = l4agsk_lookup_acceptedsk(ln, l4h);
+    }
+#endif
+    if (!sk) {
+        DBG(KERN_INFO "l4agsk: couldn't find destination socket\n");
+        ln->dev->stats.rx_dropped++;
+        goto out;
+    }
+
+    DBG(KERN_INFO "l4agsk: find destination socket.\n");
+    if (sk->sk_socket)
+        l4ag_sock_dbgprint(sk->sk_socket);
+
+    /* discard l4ag header in skb (no longer used) */
+    skb_pull(skb, sizeof(*l4h));
+
+    /* XXX Is this correct? */
+    err = sock_queue_rcv_skb(sk, skb);
+    if (err < 0) {
+        DBG(KERN_INFO "l4ag: failed to queue rcv skb.\n");
+        kfree_skb(skb);
+        goto drop;
+    }
+    DBG(KERN_INFO "l4agsk: receive data queued.\n");
+out:
+    return 0;
+drop:
+    ln->dev->stats.rx_dropped++;
+    return err;
+}
+#endif
 
 /*
  * Net device implementation.
@@ -724,8 +1057,8 @@ static int l4agctl_sendmsg(struct l4ag_struct *ln, void *data, int len)
         DBG(KERN_INFO "l4ag: can't create ctlmsg socket.\n");
         return -EINVAL;
     }
-    
-    /* send message */ 
+
+    /* send message */
     err = kernel_sendmsg(sock, &msg, &iov, 1, len);
     if (err != len)
         DBG(KERN_INFO "l4ag: failed to send ctl message.\n");
@@ -986,26 +1319,39 @@ static int l4ag_recvpacket_generic(struct l4ag_struct *ln, struct l4conn *lc)
     struct sk_buff *skb;
     struct iphdr *iph;
     __be16 proto;
-    char *data;
     int pktlen;
 
-    data = lc->recvbuf;
     while (lc->recvlen > 0) {
-        DBG(KERN_INFO "l4ag: buf: %x %x %x %x\n", data[0],
-            data[1], data[2], data[3]);
+#ifdef L4AG_TCP_DIRECT
+        /* Check whether direct packet receiving */
+        if (l4agsk_is_pending_skb(ln)) {
+            l4agsk_recvpacket(ln, lc);
+            continue;
+        }
+#endif
+        DBG(KERN_INFO "l4ag: buf: %x %x %x %x\n", lc->recvdata[0],
+            lc->recvdata[1], lc->recvdata[2], lc->recvdata[3]);
 
-        switch (data[0] & 0xf0) {
+        switch (lc->recvdata[0] & 0xf0) {
+#ifdef L4AG_TCP_DIRECT
+        case 0x20:
+            /* non-capusled packet */
+            if (lc->recvlen < sizeof(struct l4aghdr))
+                goto out_partial;
+            l4agsk_recvpacket(ln, lc);
+            continue;
+#endif
         case 0x40:
-            iph = (struct iphdr *)data;
+            iph = (struct iphdr *)lc->recvdata;
             proto = htons(ETH_P_IP);
             break;
         case 0x60:
             //proto = htons(ETH_P_IPV6);
-            lc->recvlen = 0;
+            l4cb_reset(lc);
             return -EINVAL;
         default:
             DBG(KERN_INFO "l4ag: could not determine protocol.\n");
-            lc->recvlen = 0;
+            l4cb_reset(lc);
             return -EINVAL;
         }
 
@@ -1019,11 +1365,13 @@ static int l4ag_recvpacket_generic(struct l4ag_struct *ln, struct l4conn *lc)
         DBG(KERN_INFO "l4ag: pktlen = %d\n", pktlen);
 
         if (!(skb = alloc_skb(pktlen, GFP_KERNEL))) {
+            DBG(KERN_INFO "l4ag: couldn't allocate skb.\n");
             ln->dev->stats.rx_dropped++;
+            l4cb_pull(lc, pktlen);
             return -ENOMEM;
         }
 
-        skb_copy_to_linear_data(skb, data, pktlen);
+        skb_copy_to_linear_data(skb, lc->recvdata, pktlen);
         skb_put(skb, pktlen);
         skb->ip_summed = CHECKSUM_UNNECESSARY;
         skb_reset_mac_header(skb);
@@ -1036,8 +1384,7 @@ static int l4ag_recvpacket_generic(struct l4ag_struct *ln, struct l4conn *lc)
         ln->dev->stats.rx_packets++;
         ln->dev->stats.rx_bytes += pktlen;
 
-        lc->recvlen -= pktlen;
-        data += pktlen;
+        l4cb_pull(lc, pktlen);
     }
 
     return 0;
@@ -1045,7 +1392,7 @@ static int l4ag_recvpacket_generic(struct l4ag_struct *ln, struct l4conn *lc)
 out_partial:
     /* partial packet */
     DBG(KERN_DEBUG "l4ag: partial received, pull up.\n");
-    memmove(lc->recvbuf, data, lc->recvlen);
+    l4cb_pullup(lc);
     return 0;
 }
 EXPORT_SYMBOL(l4ag_recvpacket_generic);
@@ -1062,7 +1409,7 @@ int l4ag_sendpacket_generic(struct l4ag_struct *ln)
         DBG(KERN_INFO "l4ag: there is no send socket.\n");
         return -EINVAL;
     }
-    
+
     while ((skb = skb_dequeue(&ln->sendq))) {
 retry:
         len = l4ag_sendsock(lc->send_sock, skb->data, skb->len, 0);
@@ -1084,6 +1431,21 @@ retry:
 }
 EXPORT_SYMBOL(l4ag_sendpacket_generic);
 
+struct socket *l4ag_get_primary_sendsock_generic(struct l4ag_struct *ln)
+{
+    struct l4conn *lc;
+
+    if (list_empty(&ln->l4conn_list))
+        return NULL;
+
+    lc = list_first_entry(&ln->l4conn_list, struct l4conn, list);
+    if (!l4conn_is_send_active(lc))
+        return NULL;
+
+    return lc->send_sock;
+}
+EXPORT_SYMBOL(l4ag_get_primary_sendsock_generic);
+
 static struct l4ag_operations __attribute__((unused)) l4ag_generic_ops = {
     .init = l4ag_init_generic,
     .release = l4ag_release_generic,
@@ -1094,6 +1456,7 @@ static struct l4ag_operations __attribute__((unused)) l4ag_generic_ops = {
     .change_priority = l4ag_change_priority_generic,
     .recvpacket = l4ag_recvpacket_generic,
     .sendpacket = l4ag_sendpacket_generic,
+    .get_primary_sendsock = l4ag_get_primary_sendsock_generic,
     .private_data = NULL
 };
 
@@ -1209,7 +1572,10 @@ static int l4ag_sendpacket_ab(struct l4ag_struct *ln)
     struct sk_buff *skb;
     struct l4ag_ab_info *abinfo = ln->ops->private_data;
     struct socket *send_sock;
-    int len, err;
+    int len;
+#ifdef L4AG_TCP_DIRECT
+    int err;
+#endif
 
     if (!abinfo->primary_lc) {
         DBG(KERN_INFO "l4ag: no l4 connection.\n");
@@ -1226,14 +1592,16 @@ static int l4ag_sendpacket_ab(struct l4ag_struct *ln)
     l4ag_sock_dbgprint(send_sock);
 
     while ((skb = skb_dequeue(&ln->sendq))) {
+#ifdef L4AG_TCP_DIRECT
         /* Take over the socket operations, just for test now. */
         if ((skb->sk && skb->sk->sk_socket) &&
-            !l4agsk_is_l4agsocket(skb->sk->sk_socket)) {
-            if ((skb->sk->sk_family == AF_INET) &&
-                (skb->sk->sk_protocol == IPPROTO_TCP) &&
-                (skb->sk->sk_state == TCP_ESTABLISHED)) {
+            !l4agsk_is_l4agsocket(skb->sk->sk_socket) &&
+            (skb->sk->sk_family == AF_INET) &&
+            (skb->sk->sk_protocol == IPPROTO_TCP)) {
+            if (skb->sk->sk_state == TCP_ESTABLISHED ||
+                skb->sk->sk_state == TCP_SYN_SENT) {
                 lock_sock(skb->sk);
-                DBG(KERN_INFO "l4ag: trying to take over the socket ops.\n");
+                DBG(KERN_INFO "l4ag: tcp state = %d, trying to take over the socket ops.\n", skb->sk->sk_state);
                 err = l4agsk_takeover_sock(skb->sk->sk_socket);
                 if (err < 0) {
                     DBG(KERN_INFO "l4ag: Can't take over the socket ops.\n");
@@ -1241,8 +1609,23 @@ static int l4ag_sendpacket_ab(struct l4ag_struct *ln)
                     DBG(KERN_INFO "l4ag: socket operation overrided.\n");
                 }
                 release_sock(skb->sk);
+            } else if (skb->sk->sk_state == TCP_LISTEN) {
+                /* check request socket */
+                DBG(KERN_INFO "l4ag: take over listen socket ops.\n");
+                lock_sock(skb->sk);
+                err = l4agsk_takeover_sock(skb->sk->sk_socket);
+                if (err < 0) {
+                    DBG(KERN_INFO "l4ag: Can't take over the socket ops.\n");
+                } else {
+                    DBG(KERN_INFO "l4ag: socket operation overrided.\n");
+                }
+                release_sock(skb->sk);
+            } else {
+                DBG(KERN_INFO "l4ag: tcp conn through vif, state = %d.\n",
+                    skb->sk->sk_state);
             }
         }
+#endif
 
 retry:
         len = l4ag_sendsock(send_sock, skb->data, skb->len, 0);
@@ -1273,6 +1656,7 @@ static struct l4ag_operations __attribute__((unused)) l4ag_ab_ops = {
     .change_priority = l4ag_change_priority_ab,
     .recvpacket = l4ag_recvpacket_ab,
     .sendpacket = l4ag_sendpacket_ab,
+    .get_primary_sendsock = l4ag_get_primary_sendsock_generic,
     .private_data = NULL
 };
 
@@ -1378,6 +1762,7 @@ static struct l4ag_operations __attribute__((unused)) l4ag_rr_ops = {
     .change_priority = l4ag_change_priority_generic,
     .recvpacket = l4ag_recvpacket_rr,
     .sendpacket = l4ag_sendpacket_rr,
+    .get_primary_sendsock = l4ag_get_primary_sendsock_generic,
     .private_data = NULL
 };
 
@@ -1393,16 +1778,21 @@ static int l4ag_recvthread(void *arg)
 
     DBG(KERN_INFO "l4ag: receiver thread started.\n");
     while (true) {
-        len = l4ag_recvsock(lc->recv_sock, lc->recvbuf + lc->recvlen,
-                            sizeof(lc->recvbuf) - lc->recvlen, 0);
-        if (len == 0)
-            break;
-        if (len < 0) {
-            printk(KERN_INFO "kernel_recvmsg failed with code %d.", len);
-            err = len;
-            break;
+        if (lc->recvlen < sizeof(lc->recvbuf)) {
+            len = l4ag_recvsock(lc->recv_sock, lc->recvbuf + lc->recvlen,
+                                sizeof(lc->recvbuf) - lc->recvlen, 0);
+            if (len == 0)
+                break;
+            if (len < 0) {
+                printk(KERN_INFO "kernel_recvmsg failed with code %d.", len);
+                err = len;
+                break;
+            }
+            lc->recvdata = lc->recvbuf;
+            lc->recvlen += len;
+        } else {
+            DBG(KERN_INFO "l4ag: receive buffer is full...\n");
         }
-        lc->recvlen += len;
         err = ln->ops->recvpacket(ln, lc);
         if (err < 0)
             break;
@@ -1639,12 +2029,14 @@ static int l4ag_create_device(struct net *net, struct file *file,
     ln->dev = dev;
     ln->flags = L4AG_UP | L4AG_PERSIST;
     ln->portnum = (int)ifr->ifr_data;
+    ln->pending_skb = NULL;
     ln->ctl_thread = NULL;
     ln->send_thread = NULL;
     skb_queue_head_init(&ln->sendq);
     init_completion(&ln->sendq_comp);
     INIT_LIST_HEAD(&ln->l4conn_list);
     ln->ops = &l4ag_ab_ops; // XXX should define default operations
+    default_ln = ln;    // XXX just for test
 
     err = ln->ops->init(ln);
     if (err < 0)

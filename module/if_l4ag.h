@@ -87,6 +87,7 @@ struct l4ag_struct {
     unsigned int flags;
     struct completion sendq_comp;
     struct sk_buff_head sendq;
+    struct sk_buff *pending_skb;    // XXX should be sk_buff_head ?
     struct net_device *dev;
     int portnum;
     struct socket *accept_sock;
@@ -106,10 +107,31 @@ struct l4conn {
     int pri;
     int recvlen;
     char recvbuf[8192]; // XXX length should be variable
+    char *recvdata;
     struct socket *recv_sock;
     struct task_struct *recv_thread;
     struct socket *send_sock;   // XXX should separate?
 };
+
+/* l4conn buffer functions */
+static inline void l4cb_reset(struct l4conn *lc)
+{
+    lc->recvlen = 0;
+    lc->recvdata = lc->recvbuf;
+}
+
+static inline void l4cb_pull(struct l4conn *lc, int len)
+{
+    lc->recvlen -= len;
+    WARN_ON(lc->recvlen < 0);
+    lc->recvdata += len;
+}
+
+static inline void l4cb_pullup(struct l4conn *lc)
+{
+    memmove(lc->recvbuf, lc->recvdata, lc->recvlen);
+    lc->recvdata = lc->recvbuf;
+}
 
 /* recv/send pakcet operations */
 struct l4ag_operations {
@@ -122,6 +144,7 @@ struct l4ag_operations {
     void (*change_priority)(struct l4ag_struct *, struct l4conn *);
     int (*recvpacket)(struct l4ag_struct *, struct l4conn *);
     int (*sendpacket)(struct l4ag_struct *);
+    struct socket *(*get_primary_sendsock)(struct l4ag_struct *);
     void *private_data;
 };
 
