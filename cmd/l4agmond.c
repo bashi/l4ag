@@ -23,13 +23,12 @@
 #include "if_l4ag.h"
 #include "l4agctl.h"
 
-/*
- * monitor functions.
- * XXX these implementation just for test for now...
- */
-struct l4agmon {
+/* device list implementations */
+struct dev_list {
+    struct dev_list *next;
     char ifname[IFNAMSIZ];
-    struct sockaddr_in paddr;
+    int ifindex;
+    int pri;
 };
 
 struct device_priority {
@@ -52,9 +51,69 @@ static int get_priority(char *dev)
     return 255;
 }
 
+struct dev_list *dev_list_add(struct dev_list **head, int ifindex)
+{
+    struct dev_list *list;
+    list = malloc(sizeof(*list));
+    if (list == NULL) {
+        perror("malloc");
+        return NULL;
+    }
+    getifnamebyindex(ifindex, list->ifname);
+    list->ifindex = ifindex;
+    list->pri = get_priority(list->ifname);
+    list->next = *head;
+    *head = list;
+    return list;
+}
+
+void dev_list_delete(struct dev_list **head, int ifindex)
+{
+    struct dev_list **list = head, *del;
+    for (list = head; *list; list = &(*list)->next) {
+        if ((*list)->ifindex == ifindex)
+            break;
+    }
+    if (!(*list))
+        return;
+    del = *list;
+    *list = (*list)->next;
+    free(del);
+}
+
+struct dev_list *dev_list_lookup(struct dev_list *head, int ifindex)
+{
+    struct dev_list *list;
+    for (list = head; list; list = list->next) {
+        if (list->ifindex == ifindex)
+            return list;
+    }
+    return NULL;
+}
+
+struct dev_list *dev_list_high_priority(struct dev_list *head)
+{
+    struct dev_list *list, *high = NULL;
+    for (list = head; list; list = list->next) {
+        if ((high == NULL) || (high->pri > list->pri))
+            high = list;
+    }
+    return high;
+}
+
+/*
+ * monitor functions.
+ * XXX these implementation just for test for now...
+ */
+struct l4agmon {
+    char ifname[IFNAMSIZ];
+    struct sockaddr_in paddr;
+    struct dev_list *active_devices;
+};
+
 void l4agmon_addr_assigned(struct l4agmon *lm, char *dev, struct in_addr *addr)
 {
-    int err, pri;
+    int err, pri, ifindex;
 
     printf("creating connection associated, local addr %s ...\n",
            inet_ntoa(*addr));
@@ -67,12 +126,23 @@ void l4agmon_addr_assigned(struct l4agmon *lm, char *dev, struct in_addr *addr)
     /* set priority */
     pri = get_priority(dev);
     l4agctl_setpri_cmd(lm->ifname, pri);
+    ifindex = getifindexbyname(dev);
+    dev_list_add(&lm->active_devices, ifindex);
 }
 
 void l4agmon_addr_deleted(struct l4agmon *lm, char *dev, struct in_addr *addr)
 {
+    int ifindex;
+    struct dev_list *dl;
     printf("deleting connection associated with local addr %s ...\n",
            inet_ntoa(*addr));
+    flush_route();
+    ifindex = getifindexbyname(dev);
+    dev_list_delete(&lm->active_devices, ifindex);
+    dl = dev_list_high_priority(lm->active_devices);
+    /* XXX We will need to add default gateway address for wlan and eth */
+    if (dl)
+        set_default_dev(dl->ifname);
     l4agctl_deladdr_cmd(lm->ifname, addr);
 }
 
@@ -116,48 +186,6 @@ void hexdump(char* buf, size_t len) {
         }
         printf("\n");
     }
-}
-
-int do_ifrequest(int req, struct ifreq *ifr)
-{
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) {
-        perror("socket");
-        return fd;
-    }
-    if (ioctl(fd, req, ifr) < 0) {
-        perror("ioctl");
-        close(fd);
-        return -1;
-    }
-    close(fd);
-    return 0;
-}
-
-void getifnamebyindex(int index, char *ifname)
-{
-    struct ifreq ifr;
-    memset(&ifr, 0, sizeof(ifr));
-    ifr.ifr_ifindex = index;
-    do_ifrequest(SIOCGIFNAME, &ifr);
-    strncpy(ifname, ifr.ifr_name, IFNAMSIZ);
-}
-
-int open_rtnetlink()
-{
-    struct sockaddr_nl sa;
-    int fd, error;
-
-    memset(&sa, 0, sizeof(sa));
-    sa.nl_family = AF_NETLINK;
-    sa.nl_groups = RTMGRP_IPV4_IFADDR | RTMGRP_IPV4_ROUTE;
-    fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
-    error = bind(fd, (struct sockaddr *)&sa, sizeof(sa));
-    if (error < 0) {
-        perror("bind");
-        return error;
-    }
-    return fd;
 }
 
 ssize_t nl_send_request(struct nlinfo *nli)
@@ -456,7 +484,7 @@ void usage()
 {
     char *lines[] = {
         "usage:",
-        "  l4agmond [-p <portnum>] <ifname> <remote-addr>",
+        "  l4agmond [-p <portnum>] <ifname> <remote-addr> <dev> [ <dev> ...]",
         NULL
     };
     char **p = lines;
@@ -476,7 +504,7 @@ int main(int argc, char **argv)
     int err;
 
     /* support portnum */
-    if (argc != 3)
+    if (argc < 3)
         exit_with_usage();
 
     err = init_nlinfo(&nli);
@@ -488,7 +516,17 @@ int main(int argc, char **argv)
     nli.lm.paddr.sin_family = AF_INET;
     nli.lm.paddr.sin_addr.s_addr = inet_addr(argv[2]);
     nli.lm.paddr.sin_port = htons(L4AG_DEFAULTPORT);
+    nli.lm.active_devices = NULL;
     printf("if = %s, addr = %s\n", nli.lm.ifname,
            inet_ntoa(nli.lm.paddr.sin_addr));
+    argc -= 3; argv += 3;
+    while (argc > 0) {
+        int ifindex = getifindexbyname(*argv);
+        if (ifindex >= 0) {
+            dev_list_add(&nli.lm.active_devices, ifindex);
+            printf("add waching dev %s\n", *argv);
+        }
+        --argc; ++argv;
+    }
     return nlwatch(&nli);
 }

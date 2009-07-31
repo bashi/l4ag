@@ -20,6 +20,40 @@
 
 #define L4AG_DEVICE "/dev/l4ag"
 
+int do_ifrequest(int req, struct ifreq *ifr)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        perror("socket");
+        return fd;
+    }
+    if (ioctl(fd, req, ifr) < 0) {
+        perror("ioctl");
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+void getifnamebyindex(int index, char *ifname)
+{
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    ifr.ifr_ifindex = index;
+    if (do_ifrequest(SIOCGIFNAME, &ifr) < 0) return;
+    strncpy(ifname, ifr.ifr_name, IFNAMSIZ);
+}
+
+int getifindexbyname(char *ifname)
+{
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+    if (do_ifrequest(SIOCGIFINDEX, &ifr) < 0) return -1;
+    return ifr.ifr_ifindex;
+}
+
 static int do_ioctl(int cmd, struct ifreq *ifr)
 {
     int fd;
@@ -79,6 +113,97 @@ int add_hostroute(char *dest, char *dev)
 int remove_hostroute(char *dest, char *dev)
 {
     return request_hostroute(SIOCDELRT, dest, dev);
+}
+
+/* IPv4 only */
+void flush_route() {
+    int fd = open("/proc/sys/net/ipv4/route/flush", O_WRONLY);
+    if (fd < 0) {
+        perror("open");
+        return;
+    }
+    char on = '1';
+    if (write(fd, &on, sizeof(on)) < 0) {
+        perror("write");
+    }
+    close(fd);
+}
+
+int open_rtnetlink()
+{
+    struct sockaddr_nl sa;
+    int fd, error;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.nl_family = AF_NETLINK;
+    sa.nl_groups = RTMGRP_IPV4_IFADDR | RTMGRP_IPV4_ROUTE;
+    fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    error = bind(fd, (struct sockaddr *)&sa, sizeof(sa));
+    if (error < 0) {
+        perror("bind");
+        return error;
+    }
+    return fd;
+}
+
+/* from libnetlink.h */
+#define NLMSG_TAIL(nmsg) \
+    ((struct rtattr *)(((void*)(nmsg)) + NLMSG_ALIGN((nmsg)->nlmsg_len)))
+
+int set_default_dev(char *dev)
+{
+    struct {
+        struct nlmsghdr n;
+        struct rtmsg r;
+        char buf[1024];
+    } req;
+    struct sockaddr_nl nl;
+    struct iovec iov = {
+        .iov_base = &req.n,
+        .iov_len = 0
+    };
+    struct msghdr msg = {
+        .msg_name = &nl,
+        .msg_namelen = sizeof(nl),
+        .msg_iov = &iov,
+        .msg_iovlen = 1
+    };
+    struct rtattr *rta;
+    int cmd = RTM_NEWROUTE, flags = NLM_F_REPLACE | NLM_F_CREATE;
+    int ifindex, fd, err;
+
+    memset(&nl, 0, sizeof(nl));
+    nl.nl_family = AF_NETLINK;
+    nl.nl_pid = 0;
+    nl.nl_groups = RTMGRP_IPV4_IFADDR | RTMGRP_IPV4_ROUTE;
+
+    memset(&req, 0, sizeof(req));
+    req.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+    req.n.nlmsg_flags = NLM_F_REQUEST | flags;
+    req.n.nlmsg_type = cmd;
+    req.r.rtm_family = AF_INET;
+    req.r.rtm_table = RT_TABLE_MAIN;
+    req.r.rtm_scope = RT_SCOPE_UNIVERSE;
+    req.r.rtm_type = RTN_UNICAST;
+    req.r.rtm_protocol = RTPROT_BOOT;
+    req.r.rtm_dst_len = 0;
+    rta = NLMSG_TAIL(&req.n);
+    rta->rta_type = RTA_OIF;
+    rta->rta_len = RTA_LENGTH(4);
+    ifindex = getifindexbyname(dev);
+    memcpy(RTA_DATA(rta), &ifindex, 4);
+    req.n.nlmsg_len = NLMSG_ALIGN(req.n.nlmsg_len) + RTA_LENGTH(4);
+    iov.iov_len = req.n.nlmsg_len;
+
+    fd = open_rtnetlink();
+    if (fd < 0)
+        return fd;
+    err = sendmsg(fd, &msg, 0);
+    if (err < 0) {
+        perror("sendmsg");
+    }
+    close(fd);
+    return err;
 }
 
 int l4agctl_createdevice_cmd(char *dev, int portnum)

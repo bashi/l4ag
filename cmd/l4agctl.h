@@ -1,8 +1,16 @@
 #ifndef __L4AGCTL_H
 #define __L4AGCTL_H
 
+int do_ifrequest(int req, struct ifreq *ifr);
+void getifnamebyindex(int index, char *ifname);
+int getifindexbyname(char *ifname);
+
 int add_hostroute(char *dest, char *dev);
 int remove_hostroute(char *dest, char *dev);
+void flush_route();
+
+int open_rtnetlink();
+int set_default_dev(char *dev);
 
 int l4agctl_createdevice_cmd(char *dev, int portnum);
 int l4agctl_deletedevice_cmd(char *dev);
