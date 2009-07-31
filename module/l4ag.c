@@ -43,7 +43,7 @@ static int debug = 1;
 /* uncomment this to debug. */
 #define DEBUG 1
 
-#define L4AG_TCP_DIRECT 1
+//#define L4AG_TCP_DIRECT 1
 
 #ifdef DEBUG
 # define DBG if(debug)printk
