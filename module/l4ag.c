@@ -1030,9 +1030,10 @@ static int l4agctl_sendmsg(struct l4ag_struct *ln, void *data, int len)
         .msg_controllen = 0,
         .msg_flags = MSG_DONTWAIT|MSG_NOSIGNAL,
     };
-    int err, addrlen;
+    int err, addrlen, retry = 3;
 
     /* find first active send socket */
+try_again:
     list_for_each_entry(ptr, &ln->l4conn_list, list) {
         if (l4conn_is_send_active(ptr)) {
             lc = ptr;
@@ -1059,9 +1060,17 @@ static int l4agctl_sendmsg(struct l4ag_struct *ln, void *data, int len)
     }
 
     /* send message */
+    l4ag_sockaddr_dbgprint("l4agctl: send ctl message: ", (struct sockaddr *)&addr);
     err = kernel_sendmsg(sock, &msg, &iov, 1, len);
-    if (err != len)
-        DBG(KERN_INFO "l4ag: failed to send ctl message.\n");
+    if (err != len) {
+        sock_release(sock);
+        if (--retry) {
+            DBG(KERN_INFO "l4ag: failed to send ctl message, try again...\n");
+            goto try_again;
+        }
+        DBG(KERN_INFO "l4ag: give up to send ctl message.\n");
+        return err;
+    }
 
     DBG(KERN_INFO "l4ag: ctl message send succesfully.\n");
     sock_release(sock);
