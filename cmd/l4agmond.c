@@ -37,7 +37,8 @@ struct device_priority {
     int priority;
 } device_priorities[] = {
     { .ifprefix = "eth", .priority = 10 },
-    { .ifprefix = "wlan", .priority = 100 },
+    { .ifprefix = "wlan", .priority = 20 },
+    { .ifprefix = "ppp", .priority = 30 },
     { .ifprefix = NULL, .priority = 255 }
 };
 
