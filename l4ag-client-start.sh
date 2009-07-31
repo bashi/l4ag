@@ -14,9 +14,13 @@ die() {
 	exit 1
 }
 
-L4PATH="/home/bashi/work/l4ag/cmd"
-L4CFG="$L4PATH/l4ag-config"
-L4MOND="$L4PATH/l4agmond"
+L4PATH="/home/bashi/work/l4ag"
+L4CFG="$L4PATH/cmd/l4ag-config"
+L4MOND="$L4PATH/cmd/l4agmond"
+L4MOD="$L4PATH/module/l4ag.ko"
+
+# for debug
+#E=echo
 
 PPPADDR_SERVER="192.168.30.1"
 PPPADDR_CLIENT="192.168.30.2"
@@ -26,9 +30,13 @@ DO_ROUTING="no"
 do_iproute_ppp() {
 	DEV=$1
 	SRC=`ip route show dev $DEV|grep "src"|awk '{print $7}'`
+	if [ ! "$SRC" ]; then
+		echo "no such device, $DEV"
+		die
+	fi
 	echo "ppp src = $SRC"
-	ip route add default dev $DEV table table_ppp0 2> /dev/null
-	ip rule add from $SRC table table_ppp0 2> /dev/null
+	$E ip route add default dev $DEV table table_ppp0 2> /dev/null
+	$E ip rule add from $SRC table table_ppp0 2> /dev/null
 }
 
 do_iproute_dev() {
@@ -37,10 +45,10 @@ do_iproute_dev() {
 	NET=`ip route show dev $DEV|grep "src"|awk '{print $1}'`
 	GW=`ip route show dev $DEV|grep "default"|awk '{print $3}'`
 	echo "dev src = $SRC, net = $NET, gateway = $GW"
-	ip route add $NET dev $DEV src $SRC table table_${DEV} 2> /dev/null
-	ip route add default via $GW table table_${DEV} 2> /dev/null
-	ip route add $NET dev $DEV src $SRC
-	ip rule add from $SRC table table_${DEV} 2> /dev/null
+	$E ip route add $NET dev $DEV src $SRC table table_${DEV} 2> /dev/null
+	$E ip route add default via $GW table table_${DEV} 2> /dev/null
+	#$E ip route add $NET dev $DEV src $SRC
+	$E ip rule add from $SRC table table_${DEV} 2> /dev/null
 }
 
 do_iproute() {
@@ -56,7 +64,7 @@ do_iproute() {
 # parse options
 while getopts l:r:t ops
 do
-	case ${opt} in
+	case ${ops} in
 	l)
 		PPPADDR_LOCAL=${OPTARG};;
 	r)
@@ -75,6 +83,8 @@ fi
 SERVADDR=$1
 shift
 
+insmod $L4MOD 2> /dev/null
+
 # add routing information
 if [ "$DO_ROUTING" = "yes" ]; then
 	for dev in "$@"; do
@@ -83,10 +93,10 @@ if [ "$DO_ROUTING" = "yes" ]; then
 fi
 	
 # create l4ag device (assume devname = l4ag0)
-$L4CFG create l4ag0 || die
+$E $L4CFG create l4ag0 || die
 
 # set p-to-p addresses
-ifconfig l4ag0 $PPPADDR_CLIENT pointopoint $PPPADDR_SERVER || die
+$E ifconfig l4ag0 $PPPADDR_CLIENT pointopoint $PPPADDR_SERVER || die
 
 # create l4 connection for each interface
 for dev in "$@"; do
@@ -97,9 +107,9 @@ for dev in "$@"; do
 	ppp) PRI=30;;
 	?) PRI=50;;
 	esac
-	$L4CFG peer -s "$dev" -P $PRI l4ag0 $SERVADDR
+	$E $L4CFG peer -s "$dev" -P $PRI l4ag0 $SERVADDR
 done
 
 # launch l4agmond
-$L4MOND l4ag0 $SERVADDR
+$E $L4MOND l4ag0 $SERVADDR $@
 

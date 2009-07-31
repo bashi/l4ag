@@ -13,8 +13,9 @@ die() {
 	exit 1
 }
 
-L4PATH="/home/bashi/work/l4ag/cmd"
-L4CFG="$L4PATH/l4ag-config"
+L4PATH="/home/bashi/work/l4ag"
+L4CFG="$L4PATH/cmd/l4ag-config"
+L4MOD="$L4PATH/module/l4ag.ko"
 
 PPPADDR_SERVER="192.168.30.1"
 PPPADDR_CLIENT="192.168.30.2"
@@ -31,6 +32,8 @@ do
 done
 
 shift $(($OPTIND - 1))
+
+insmod $L4MOD 2> /dev/null
 
 # create l4ag device (assume devname = l4ag0)
 $L4CFG create l4ag0 || die
