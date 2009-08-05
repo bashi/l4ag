@@ -1,12 +1,11 @@
 #!/bin/bash
 
-# usage: l4ag-start.sh [ options ] dev1 [ dev2 ...]
-# options:
-#   -l addr
-#   -r addr
-#   -t
 exit_with_usage() {
-	echo "usage: l4ag-start-client.sh [-l addr ] [-r addr] [-t] servaddr dev1 [ dev2 ...]"
+	echo "usage: l4ag-client-start.sh [options] servaddr dev1 [ dev2 ...]"
+    echo "  -l addr        specify local address of the tunnel"
+    echo "  -r addr        specify remote address of the tunnel"
+    echo "  -a algorithm   specify recv/send algorithm"
+    echo "  -t             set mulit-homed routing information before start"
 	exit 1
 }
 
@@ -25,6 +24,7 @@ L4MOD="$L4PATH/module/l4ag.ko"
 PPPADDR_SERVER="192.168.30.1"
 PPPADDR_CLIENT="192.168.30.2"
 DO_ROUTING="no"
+ALGORITHM="actstby"  # default algorithm = active/backup
 
 # add routing information
 do_iproute_ppp() {
@@ -62,9 +62,11 @@ do_iproute() {
 }
 
 # parse options
-while getopts l:r:t ops
+while getopts a:l:r:t ops
 do
 	case ${ops} in
+    a)
+        ALGORITHM=${OPTARG};;
 	l)
 		PPPADDR_LOCAL=${OPTARG};;
 	r)
@@ -95,13 +97,16 @@ fi
 # create l4ag device (assume devname = l4ag0)
 $E $L4CFG create l4ag0 || die
 
+# set algorithm involved
+$E $L4CFG algorithm l4ag0 $ALGORITHM || die
+
 # set p-to-p addresses
 $E ifconfig l4ag0 $PPPADDR_CLIENT pointopoint $PPPADDR_SERVER || die
 
 # create l4 connection for each interface
 for dev in "$@"; do
 	DEVNAME=`echo $dev | sed -e 's/[0-9]\+$//'`
-	case "$DEVNAME" in 
+	case "$DEVNAME" in
 	eth) PRI=10;;
 	wlan) PRI=20;;
 	ppp) PRI=30;;
