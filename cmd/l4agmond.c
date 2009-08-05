@@ -231,8 +231,8 @@ static void print_rtattr_ifa(char *prefix, struct rtattr *rta)
     printf("\n");
 }
 
-static void print_rtmsg(char *prefix, struct l4agmon *lm, struct nlmsghdr *rnh, struct rtmsg *rtm) __attribute__((unused));
-static void print_rtmsg(char *prefix, struct l4agmon *lm, struct nlmsghdr *rnh, struct rtmsg *rtm)
+static void print_rtmsg(char *prefix, struct rtmsg *rtm, int len) __attribute__((unused));
+static void print_rtmsg(char *prefix, struct rtmsg *rtm, int len)
 {
     static char *rtatypes[] = {
         "RTA_UNSPEC",
@@ -304,10 +304,11 @@ static void print_rtmsg(char *prefix, struct l4agmon *lm, struct nlmsghdr *rnh, 
 
     printf("%s(family=%s,scope=%s,type=%s,table=%s)\n",
            prefix, family, scope, type, table);
-    rta = (struct rtattr *)((char *)NLMSG_DATA(rnh)
-                            + NLMSG_ALIGN(sizeof(*rtm)));
-    for (; RTA_OK(rta, rnh->nlmsg_len);
-         rta = RTA_NEXT(rta, rnh->nlmsg_len)) {
+    //rta = (struct rtattr *)((char *)NLMSG_DATA(rnh)
+    //+ NLMSG_ALIGN(sizeof(*rtm)));
+    rta = RTM_RTA(rtm);
+    for (; RTA_OK(rta, len);
+         rta = RTA_NEXT(rta, len)) {
         if (rta->rta_type > __RTA_MAX)
             continue;
         printf("  rtattr: type=%s", rtatypes[rta->rta_type]);
@@ -393,14 +394,14 @@ int nlmsg_deladdr_handler(struct nlinfo *nli, struct nlmsghdr *rnh)
 int nlmsg_newroute_handler(struct nlinfo *nli, struct nlmsghdr *rnh)
 {
     struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(rnh);
-    print_rtmsg("route added, ", &nli->lm, rnh, rtm);
+    print_rtmsg("route added, ", rtm, rnh->nlmsg_len);
     return 0;
 }
 
 int nlmsg_delroute_handler(struct nlinfo *nli, struct nlmsghdr *rnh)
 {
     struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(rnh);
-    print_rtmsg("route deleted, ", &nli->lm, rnh, rtm);
+    print_rtmsg("route deleted, ", rtm, rnh->nlmsg_len);
     return 0;
 }
 
@@ -427,10 +428,6 @@ struct nlmsg_handler {
 int nl_handle_message(struct nlinfo *nli, struct nlmsghdr *rnh)
 {
     struct nlmsg_handler *nlh;
-#if 0
-    printf("nlmsghdr nlmsg_len = %d, type = %d\n",
-           rnh->nlmsg_len, rnh->nlmsg_type);
-#endif
     for (nlh = nlmsg_handlers; nlh->type != -1; nlh++) {
         if (nlh->type == rnh->nlmsg_type)
             return nlh->handler(nli, rnh);
@@ -497,6 +494,93 @@ void exit_with_usage()
     usage();
     exit(1);
 }
+
+#if 0
+/* XXX for future use to get default gw */
+int show_dev_defaultgw(char *dev)
+{
+    struct {
+        struct nlmsghdr nlh;
+        struct rtmsg rtm;
+        char buf[1024];
+    } req;
+    char buf[4096*4];
+    struct sockaddr_nl nl;
+    struct nlmsghdr *rnh;
+    struct iovec iov = {
+        .iov_base = &req.nlh,
+        .iov_len = 0
+    };
+    struct msghdr msg = {
+        .msg_name = &nl,
+        .msg_namelen = sizeof(nl),
+        .msg_iov = &iov,
+        .msg_iovlen = 1
+    };
+    struct rtattr *rta;
+    int ifindex, fd, len;
+
+    memset(&nl, 0, sizeof(nl));
+    memset(&req, 0, sizeof(req));
+    nl.nl_family = AF_NETLINK;
+
+    req.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+    req.nlh.nlmsg_type = RTM_GETROUTE;
+    req.nlh.nlmsg_flags = NLM_F_ROOT|NLM_F_MATCH|NLM_F_REQUEST;
+    req.nlh.nlmsg_pid = 0;
+    req.nlh.nlmsg_seq = 1;  // XXX
+    req.rtm.rtm_family = AF_INET;
+    req.rtm.rtm_table = RT_TABLE_MAIN;
+    req.rtm.rtm_scope = RT_SCOPE_UNIVERSE;
+    req.rtm.rtm_type = RTN_UNICAST;
+    req.rtm.rtm_protocol = RTPROT_BOOT;
+    req.rtm.rtm_dst_len = 0;
+    rta = NLMSG_TAIL(&req.nlh);
+    rta->rta_type = RTA_OIF;
+    rta->rta_len = RTA_LENGTH(4);
+    ifindex = getifindexbyname(dev);
+    memcpy(RTA_DATA(rta), &ifindex, 4);
+    req.nlh.nlmsg_len = NLMSG_ALIGN(req.nlh.nlmsg_len) + RTA_LENGTH(4);
+    iov.iov_len = req.nlh.nlmsg_len;
+
+    fd = open_rtnetlink();
+    if (fd < 0)
+        return fd;
+    len = sendmsg(fd, &msg, 0);
+    if (len < 0) {
+        perror("sendmsg");
+        close(fd);
+        return len;
+    }
+
+    memset(buf, 0, sizeof(buf));
+    iov.iov_base = buf;
+    iov.iov_len = sizeof(buf);
+    len = recvmsg(fd, &msg, 0);
+    if (len < 0) {
+        perror("recvmsg");
+        close(fd);
+        return len;
+    }
+    hexdump(buf, len);
+    for (rnh = (struct nlmsghdr *)buf;
+         NLMSG_OK(rnh, len); rnh = NLMSG_NEXT(rnh, len)) {
+        if (rnh->nlmsg_type == NLMSG_DONE)
+            continue;
+        else if (rnh->nlmsg_type == NLMSG_ERROR)
+            continue;
+        else if (rnh->nlmsg_type == RTM_NEWROUTE ||
+            rnh->nlmsg_type == RTM_DELROUTE ||
+            rnh->nlmsg_type == RTM_GETROUTE)
+            print_rtmsg("result, ", (struct rtmsg *)NLMSG_DATA(rnh), len);
+        else {
+            printf("type = %d\n", rnh->nlmsg_type);
+        }
+    }
+    close(fd);
+    return 0;
+}
+#endif
 
 int main(int argc, char **argv)
 {

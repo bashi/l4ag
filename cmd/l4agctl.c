@@ -146,10 +146,6 @@ int open_rtnetlink()
     return fd;
 }
 
-/* from libnetlink.h */
-#define NLMSG_TAIL(nmsg) \
-    ((struct rtattr *)(((void*)(nmsg)) + NLMSG_ALIGN((nmsg)->nlmsg_len)))
-
 int set_default_dev(char *dev)
 {
     struct {

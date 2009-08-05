@@ -1,6 +1,12 @@
 #ifndef __L4AGCTL_H
 #define __L4AGCTL_H
 
+/* from libnetlink.h */
+#ifndef NLMSG_TAIL
+#define NLMSG_TAIL(nmsg) \
+    ((struct rtattr *)(((void*)(nmsg)) + NLMSG_ALIGN((nmsg)->nlmsg_len)))
+#endif
+
 int do_ifrequest(int req, struct ifreq *ifr);
 void getifnamebyindex(int index, char *ifname);
 int getifindexbyname(char *ifname);
