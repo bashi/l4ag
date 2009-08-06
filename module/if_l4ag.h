@@ -29,7 +29,9 @@ enum {
     L4AG_OPS_GENERIC = 0,   /* generic operation */
     L4AG_OPS_ACTSTBY = 1,   /* active/backup operation */
     L4AG_OPS_RR = 2,        /* roundrobin operation */
-    __L4AG_OPS_MAX = 3,
+    L4AG_OPS_RB = 3,        /* rtt based operation */
+    L4AG_OPS_BR = 4,        /* broadcast operation, doesn't implement for now */
+    __L4AG_OPS_MAX = 4,
 };
 
 /* l4conn flags */
@@ -111,6 +113,7 @@ struct l4conn {
     struct socket *recv_sock;
     struct task_struct *recv_thread;
     struct socket *send_sock;   // XXX should separate?
+    void *private_data;
 };
 
 /* l4conn buffer functions */

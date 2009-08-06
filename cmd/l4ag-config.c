@@ -31,7 +31,7 @@ void usage() {
         "  l4ag-config peer [-s <ifname>] [-P <priority>] <ifname> <addr> [<portnum>]",
         "  l4ag-config deladdr <ifname> <addr>",
         "  l4ag-config algorithm <ifname> <algorithm>",
-        "    <algorithm> = generic | actstby | rr",
+        "    <algorithm> = generic | actstby | rr | rtt-based",
         NULL
     };
     char **p = lines;
@@ -158,7 +158,8 @@ int delete_addr(int argc, char **argv)
 char *algorithm_names[] = {
     "generic",
     "actstby",
-    "rr"
+    "rr",
+    "rtt-based"
 };
 
 int set_algorithm(int argc, char **argv)

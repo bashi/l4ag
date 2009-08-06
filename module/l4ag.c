@@ -875,6 +875,7 @@ static struct l4conn *l4ag_create_l4conn(struct l4ag_struct *ln, int flags)
     lc->recv_sock = NULL;
     lc->send_sock = NULL;
     lc->recv_thread = NULL;
+    lc->private_data = NULL;
     list_add(&lc->list, &ln->l4conn_list);
     DBG(KERN_INFO "l4ag: create l4conn struct.\n");
     return lc;
@@ -1279,6 +1280,10 @@ out:
     DBG(KERN_INFO "l4ag: ctlmsg thread stop.\n");
     return err;
 }
+
+/*
+ * l4ag recv/send operation algorithms.
+ */
 
 /* generic l4ag operations */
 int l4ag_init_generic(struct l4ag_struct *ln)
@@ -1775,6 +1780,147 @@ static struct l4ag_operations __attribute__((unused)) l4ag_rr_ops = {
     .private_data = NULL
 };
 
+/* rtt-based sending algorithm */
+
+struct l4ag_rb_info {
+    u32 metric;
+    u32 tx_segments;
+};
+
+static inline u32 l4ag_get_rtt_metric(struct l4conn *lc)
+{
+    struct tcp_sock *tsk = tcp_sk(lc->send_sock->sk);
+    return tsk->srtt;
+}
+
+static void l4ag_add_socket_rb(struct l4ag_struct *ln, struct l4conn *lc)
+{
+    struct l4ag_rb_info *ri;
+    if (lc->private_data)
+        return;
+    ri = kmalloc(sizeof(*ri), GFP_KERNEL | GFP_ATOMIC);
+    if (!ri) {
+        DBG(KERN_INFO "l4ag: can't allocate memory.\n");
+        return;
+    }
+    ri->metric = l4ag_get_rtt_metric(lc);
+    ri->tx_segments = 0;
+    DBG(KERN_INFO "l4ag: set metric: %d\n", ri->metric);
+    lc->private_data = (void *)ri;
+}
+
+static void l4ag_delete_socket_rb(struct l4ag_struct *ln, struct l4conn *lc)
+{
+    if (!lc->private_data)
+        return;
+    kfree(lc->private_data);
+    lc->private_data = NULL;
+}
+
+static int l4ag_recvpacket_rb(struct l4ag_struct *ln, struct l4conn *lc)
+{
+    return l4ag_recvpacket_generic(ln, lc);
+}
+
+static inline int l4ag_rtt_metric_lt(struct l4conn *lhs, struct l4conn *rhs)
+{
+    struct l4ag_rb_info *l, *r;
+    l = (struct l4ag_rb_info *)lhs->private_data;
+    r = (struct l4ag_rb_info *)rhs->private_data;
+    return l->metric < r->metric;
+}
+
+static inline void l4ag_reset_rtt_metric(struct l4conn *lc)
+{
+    struct l4ag_rb_info *ri = (struct l4ag_rb_info *)lc->private_data;
+    ri->metric = l4ag_get_rtt_metric(lc);
+    DBG(KERN_INFO "l4ag: rtt metric reset to %d\n", ri->metric);
+}
+
+static inline void l4ag_update_rtt_metric(struct l4conn *lc)
+{
+    struct l4ag_rb_info *ri = (struct l4ag_rb_info *)lc->private_data;
+    ri->metric += l4ag_get_rtt_metric(lc);
+    ri->tx_segments++;
+    DBG(KERN_INFO "l4ag: rtt metric update to %d\n", ri->metric);
+}
+
+static int l4ag_sendpacket_rb(struct l4ag_struct *ln)
+{
+    struct l4conn *lc, *ptr;
+    struct sk_buff *skb;
+    int len;
+
+    if (list_empty(&ln->l4conn_list))
+        return -EINVAL;
+
+    DBG(KERN_INFO "l4ag: rtt-based send packet.\n");
+    while (!skb_queue_empty(&ln->sendq)) {
+        /* determin which l4conn is the best connection to send with rtt */
+        lc = NULL;
+        list_for_each_entry(ptr, &ln->l4conn_list, list) {
+            if (!l4conn_is_send_active(ptr)) {
+                l4ag_delete_l4conn(ln, ptr);
+                continue;
+            }
+            if (lc == NULL || l4ag_rtt_metric_lt(ptr, lc)) {
+                if (lc)
+                    l4ag_reset_rtt_metric(lc);
+                lc = ptr;
+            } else {
+                l4ag_reset_rtt_metric(ptr);
+            }
+        }
+        if (!lc) {
+            DBG(KERN_INFO "l4ag: there is no active send socket.\n");
+            return -EINVAL;
+        }
+
+        DBG(KERN_INFO "l4ag: tx_segs = %d\n",
+            ((struct l4ag_rb_info*)lc->private_data)->tx_segments);
+        l4ag_sock_dbgprint(lc->send_sock);
+
+        skb = skb_dequeue(&ln->sendq);
+        if (!skb)
+            goto out;
+send_again:
+        len = l4ag_sendsock(lc->send_sock, skb->data, skb->len, 0);
+        if (len < 0) {
+            printk(KERN_INFO "l4ag: failed to send packet.\n");
+            kfree_skb(skb);
+            return len;
+        }
+        if (len != skb->len) {
+            ln->dev->stats.tx_bytes += len;
+            skb_pull(skb, len);
+            /* XXX Does this correct?
+               Should we re-choice the connection to send? */
+            goto send_again;
+        }
+        ln->dev->stats.tx_packets++;
+        ln->dev->stats.tx_bytes += len;
+        kfree_skb(skb);
+        l4ag_update_rtt_metric(lc);
+    }
+
+out:
+    return 0;
+}
+
+static struct l4ag_operations __attribute__((unused)) l4ag_rb_ops = {
+    .init = l4ag_init_generic,
+    .release = l4ag_release_generic,
+    .add_recvsocket = l4ag_add_socket_rb,
+    .add_sendsocket = l4ag_add_socket_rb,
+    .delete_recvsocket = l4ag_delete_socket_rb,
+    .delete_sendsocket = l4ag_delete_socket_rb,
+    .change_priority = l4ag_change_priority_generic,
+    .recvpacket = l4ag_recvpacket_rb,
+    .sendpacket = l4ag_sendpacket_rb,
+    .get_primary_sendsock = l4ag_get_primary_sendsock_generic,
+    .private_data = NULL
+};
+
 /* Receiver thread */
 static int l4ag_recvthread(void *arg)
 {
@@ -2252,6 +2398,7 @@ static struct l4ag_operations *l4ag_ops_array[] = {
     &l4ag_generic_ops,  /* L4AG_OPS_GENERIC */
     &l4ag_ab_ops,       /* L4AG_OPS_ACTSTBY */
     &l4ag_rr_ops,       /* L4AG_OPS_RR */
+    &l4ag_rb_ops,       /* L4AG_OPS_RB */
 };
 
 static int l4ag_set_operation(struct net *net, struct file *file,
