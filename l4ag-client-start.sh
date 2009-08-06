@@ -62,11 +62,11 @@ do_iproute() {
 }
 
 # parse options
-while getopts a:l:r:t ops
+while getopts a:l:r:t opt
 do
-	case ${ops} in
-    a)
-        ALGORITHM=${OPTARG};;
+	case ${opt} in
+  a)
+    ALGORITHM=${OPTARG};;
 	l)
 		PPPADDR_LOCAL=${OPTARG};;
 	r)
@@ -86,6 +86,9 @@ SERVADDR=$1
 shift
 
 insmod $L4MOD 2> /dev/null
+
+# wait for complete of l4ag device initialization
+sleep 1
 
 # add routing information
 if [ "$DO_ROUTING" = "yes" ]; then
@@ -117,4 +120,7 @@ done
 
 # launch l4agmond
 $E $L4MOND l4ag0 $SERVADDR $@
+
+# delete l4ag interface
+$E $L4CFG delete l4ag0
 
