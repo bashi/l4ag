@@ -24,7 +24,7 @@ PPPADDR_CLIENT="192.168.30.2"
 ALGORITHM="actstby"  # default algorithm = active/backup
 
 # parse options
-while getopts l:r: opt
+while getopts a:l:r: opt
 do
 	case ${opt} in
   a)
