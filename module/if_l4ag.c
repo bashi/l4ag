@@ -38,18 +38,11 @@
 #define DRV_DESCRIPTION "Layer 4 aggregation driver"
 #define DRV_COPYRIGHT "(C) 2009 Kenichi Ishibashi <kenich-i@is.naist.jp>"
 
-static int debug = 1;
-
-/* uncomment this to debug. */
-#define DEBUG 1
-
+/* uncomment this to enable TCP_DIRECT */
 //#define L4AG_TCP_DIRECT 1
 
-#ifdef DEBUG
-# define DBG if(debug)printk
-#else
-# define DBG( a... )
-#endif
+/* uncomment this to enable TCP_CA */
+#define L4AG_TCP_CA
 
 #define ADDR_EQUAL(addr1, addr2) \
     (memcmp((addr1), (addr2), sizeof(*(addr1))) == 0)
@@ -671,6 +664,89 @@ drop:
     return err;
 }
 #endif
+
+/*
+ * TCP congestion operations for l4ag upper layer socket.
+ * This ops set to upper layer TCP connection to be disable
+ * congestion control.
+ */
+
+/*
+ * XXX these function just acts as proxy of tcp_reno for now.
+ * We must fix it to work property.
+ */
+
+static void l4ag_ca_init_generic(struct sock *sk)
+{
+    DBG(KERN_INFO "l4agcong: init called.\n");
+}
+
+static void l4ag_ca_release_generic(struct sock *sk)
+{
+    DBG(KERN_INFO "l4agcong: release called.\n");
+}
+
+static u32 l4ag_ca_ssthresh_generic(struct sock *sk)
+{
+    DBG(KERN_INFO "l4agcong: ssthresh called.\n");
+    return tcp_reno_ssthresh(sk);  // XXX
+}
+
+static u32 l4ag_ca_min_cwnd_generic(const struct sock *sk)
+{
+    DBG(KERN_INFO "l4agcong: min_cwnd called.\n");
+    return tcp_reno_min_cwnd(sk);   // XXX
+}
+
+static void l4ag_ca_cong_avoid_generic(struct sock *sk, u32 ack, u32 in_flight)
+{
+    DBG(KERN_INFO "l4agcong: cong_avoid called.\n");
+    tcp_reno_cong_avoid(sk, ack, in_flight);    // XXX
+}
+
+static void l4ag_ca_set_state_generic(struct sock *sk, u8 new_state)
+{
+    DBG(KERN_INFO "l4agcong: set_state called.\n");
+}
+
+static void l4ag_ca_cwnd_event_generic(struct sock *sk, enum tcp_ca_event ev)
+{
+    DBG(KERN_INFO "l4agcong: cwnd_event called, ev=%d.\n", ev);
+}
+
+static u32 l4ag_ca_undo_cwnd_generic(struct sock *sk)
+{
+    DBG(KERN_INFO "l4agcong: undo_cwnd called.\n");
+    return tcp_sk(sk)->snd_cwnd;    // XXX
+}
+
+static void l4ag_ca_pkts_acked_generic(struct sock *sk, u32 num_acked,
+                                       s32 rtt_us)
+{
+    DBG(KERN_INFO "l4agcong: pkts_acked called.\n");
+    DBG(KERN_INFO "  acked=%d, rtt_us=%d\n", num_acked, rtt_us);
+}
+
+static void l4ag_ca_get_info_generic(struct sock *sk, u32 ext,
+                                     struct sk_buff *skb)
+{
+    DBG(KERN_INFO "l4agcong: get_info called.\n");
+}
+
+struct tcp_congestion_ops tcp_l4ag_nocong = {
+    .owner = THIS_MODULE,
+    .name = "l4ag_nocong",
+    .init = l4ag_ca_init_generic,
+    .release = l4ag_ca_release_generic,
+    .ssthresh = l4ag_ca_ssthresh_generic,
+    .min_cwnd = l4ag_ca_min_cwnd_generic,
+    .cong_avoid = l4ag_ca_cong_avoid_generic,
+    .set_state = l4ag_ca_set_state_generic,
+    .cwnd_event = l4ag_ca_cwnd_event_generic,
+    .undo_cwnd = l4ag_ca_undo_cwnd_generic,
+    .pkts_acked = l4ag_ca_pkts_acked_generic,
+    .get_info = l4ag_ca_get_info_generic,
+};
 
 /*
  * Net device implementation.
@@ -1787,9 +1863,46 @@ struct l4ag_rb_info {
     u32 tx_segments;
 };
 
+static inline int l4ag_is_active_tcpsk(struct sock *sk)
+{
+    if (sk && sk->sk_socket && sk->sk_family == AF_INET &&
+        sk->sk_protocol == IPPROTO_TCP && sk->sk_state == TCP_ESTABLISHED)
+        return 1;
+    return 0;
+}
+
+static inline int l4ag_takeover_cong_ops(struct sock *sk,
+                                         struct tcp_congestion_ops *ops)
+{
+    struct inet_connection_sock *icsk = inet_csk(sk);
+
+    if (icsk->icsk_ca_ops == ops)
+        return 0;
+
+    DBG(KERN_INFO "l4agcong: try to set cong ops to l4ag.\n");
+
+    /* just a copy of tcp_set_congestion_control() defined in tcp_cong.c */
+    if (!try_module_get(ops->owner))
+        return -EBUSY;
+
+    if (icsk->icsk_ca_ops->release)
+        icsk->icsk_ca_ops->release(sk);
+    module_put(icsk->icsk_ca_ops->owner);
+    icsk->icsk_ca_ops = ops;
+    if (sk->sk_state != TCP_CLOSE && icsk->icsk_ca_ops->init)
+        icsk->icsk_ca_ops->init(sk);
+
+    return 0;
+}
+
 static inline u32 l4ag_get_rtt_metric(struct l4conn *lc)
 {
     struct tcp_sock *tsk = tcp_sk(lc->send_sock->sk);
+    DBG(KERN_INFO "l4ag: tcpsock stats\n");
+    DBG(KERN_INFO "  srtt=%d, mdev=%d,mdev_max=%d,rttvar=%d",
+        tsk->srtt, tsk->mdev, tsk->mdev_max, tsk->rttvar);
+    DBG(KERN_INFO "  rtt=%d, seq=%d, time=%d\n",
+        tsk->rcv_rtt_est.rtt, tsk->rcv_rtt_est.seq, tsk->rcv_rtt_est.time);
     return tsk->srtt;
 }
 
@@ -1883,6 +1996,13 @@ static int l4ag_sendpacket_rb(struct l4ag_struct *ln)
         skb = skb_dequeue(&ln->sendq);
         if (!skb)
             goto out;
+#ifdef L4AG_TCP_CA
+/*
+        if (l4ag_is_active_tcpsk(skb->sk))
+            l4ag_takeover_cong_ops(skb->sk, &tcp_l4ag_nocong);
+*/
+#endif
+
 send_again:
         len = l4ag_sendsock(lc->send_sock, skb->data, skb->len, 0);
         if (len < 0) {
@@ -2037,6 +2157,10 @@ static int l4conn_create_sendsock(struct l4conn *lc,
         lc->send_sock = NULL;
         return err;
     }
+
+#ifdef L4AG_TCP_CA
+    l4ag_takeover_cong_ops(lc->send_sock->sk, &cubicl4ag);
+#endif
 
     lc->flags |= L4CONN_SENDACTIVE;
     lc->l4st->ops->add_sendsocket(lc->l4st, lc);
@@ -2493,10 +2617,6 @@ static int l4ag_fops_ioctl(struct inode *inode, struct file *file,
     }
 
     if (cmd == L4AGIOCSDEBUG) {
-        if (arg)
-            debug = 1;
-        else
-            debug = 0;
         return 0;
     }
 
@@ -2671,6 +2791,14 @@ static int __init l4ag_init(void)
     memcpy(&l4ag_prot, &tcp_prot, sizeof(l4ag_prot));
     l4ag_prot.slab = NULL;
 
+#ifdef L4AG_TCP_CA
+    err = tcp_register_congestion_control(&tcp_l4ag_nocong);
+    if (err) {
+        printk(KERN_INFO "l4ag: Can't register congestion ops.\n");
+        goto err_misc;
+    }
+    cubicl4ag_register();
+#endif
     return 0;
 err_misc:
     unregister_pernet_gen_device(l4ag_net_id, &l4ag_net_ops);
@@ -2682,6 +2810,10 @@ static void l4ag_cleanup(void)
 {
     misc_deregister(&l4ag_miscdev);
     unregister_pernet_gen_device(l4ag_net_id, &l4ag_net_ops);
+#ifdef L4AG_TCP_CA
+    tcp_unregister_congestion_control(&tcp_l4ag_nocong);
+    cubicl4ag_unregister();
+#endif
 }
 
 module_init(l4ag_init);

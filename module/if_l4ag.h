@@ -3,6 +3,15 @@
 
 #include <linux/types.h>
 
+/* uncomment this to debug. */
+#define DEBUG 1
+
+#ifdef DEBUG
+# define DBG printk
+#else
+# define DBG( a... )
+#endif
+
 #ifndef __KERNEL__
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -163,6 +172,11 @@ struct l4ag_operations {
 
 #define L4AGCTL_INITMSG(msg, cmd) \
     ({ msg.hdr.type = cmd; msg.hdr.length = htons(sizeof(msg)); })
+
+/* TCP CUBIC for l4ag */
+extern struct tcp_congestion_ops cubicl4ag;
+int cubicl4ag_register(void);
+void cubicl4ag_unregister(void);
 
 #endif /* __KERNEL__ */
 

@@ -1,6 +1,6 @@
 ifneq ($(KERNELRELEASE),)
 	obj-m := l4ag.o
-	#l4ag-objs := l4ag.o
+	l4ag-objs := if_l4ag.o l4ag_cubic.o
 else
 	KERNELDIR ?= /lib/modules/$(shell uname -r)/build
   PWD := $(shell pwd)
