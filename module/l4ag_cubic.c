@@ -303,6 +303,7 @@ static void bictcp_acked(struct sock *sk, u32 cnt, s32 rtt_us)
 {
 	const struct inet_connection_sock *icsk = inet_csk(sk);
 	struct bictcp *ca = inet_csk_ca(sk);
+    struct l4conn *lc;
 	u32 delay;
 
     DBG(KERN_INFO "l4agcub: acked, cnt=%d, rtt_us=%d\n", cnt, rtt_us);
@@ -311,6 +312,11 @@ static void bictcp_acked(struct sock *sk, u32 cnt, s32 rtt_us)
 		cnt -= ca->delayed_ack >> ACK_RATIO_SHIFT;
 		ca->delayed_ack += cnt;
 	}
+
+    /* --- l4ag code --- */
+    lc = l4ag_lookup_l4conn_by_sendsk(sk);
+    if (lc && lc->l4st->ops->sendsock_acked)
+        lc->l4st->ops->sendsock_acked(lc->l4st, lc, rtt_us);
 
 	/* Some calls are for duplicates without timetamps */
 	if (rtt_us < 0)

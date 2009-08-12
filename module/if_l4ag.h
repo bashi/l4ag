@@ -157,6 +157,7 @@ struct l4ag_operations {
     int (*recvpacket)(struct l4ag_struct *, struct l4conn *);
     int (*sendpacket)(struct l4ag_struct *);
     struct socket *(*get_primary_sendsock)(struct l4ag_struct *);
+    void (*sendsock_acked)(struct l4ag_struct *, struct l4conn *, s32 rtt_us);
     void *private_data;
 };
 
@@ -172,6 +173,9 @@ struct l4ag_operations {
 
 #define L4AGCTL_INITMSG(msg, cmd) \
     ({ msg.hdr.type = cmd; msg.hdr.length = htons(sizeof(msg)); })
+
+/* l4ag functions for congestion control ops */
+struct l4conn *l4ag_lookup_l4conn_by_sendsk(struct sock *sk);
 
 /* TCP CUBIC for l4ag */
 extern struct tcp_congestion_ops cubicl4ag;

@@ -671,6 +671,20 @@ drop:
  * congestion control.
  */
 
+struct l4conn *l4ag_lookup_l4conn_by_sendsk(struct sock *sk)
+{
+    struct l4conn *lc;
+
+    if (!default_ln)
+        return NULL;
+
+    list_for_each_entry(lc, &default_ln->l4conn_list, list) {
+        if (lc->send_sock->sk == sk)
+            return lc;
+    }
+    return NULL;
+}
+
 /*
  * XXX these function just acts as proxy of tcp_reno for now.
  * We must fix it to work property.
@@ -2027,6 +2041,22 @@ out:
     return 0;
 }
 
+static void l4ag_sendsock_acked_rb(struct l4ag_struct *ln,
+                                   struct l4conn *lc, s32 rtt_us)
+{
+    struct l4ag_rb_info *ri = (struct l4ag_rb_info *)lc->private_data;
+    u32 metric;
+
+    /* XXX temporary code */
+    metric = l4ag_get_rtt_metric(lc);
+    if (ri->metric < metric)
+        ri->metric = metric;
+    else
+        ri->metric -= metric;
+
+    DBG(KERN_INFO "l4ag: acked, metric=%d\n", ri->metric);
+}
+
 static struct l4ag_operations __attribute__((unused)) l4ag_rb_ops = {
     .init = l4ag_init_generic,
     .release = l4ag_release_generic,
@@ -2038,6 +2068,7 @@ static struct l4ag_operations __attribute__((unused)) l4ag_rb_ops = {
     .recvpacket = l4ag_recvpacket_rb,
     .sendpacket = l4ag_sendpacket_rb,
     .get_primary_sendsock = l4ag_get_primary_sendsock_generic,
+    .sendsock_acked = l4ag_sendsock_acked_rb,
     .private_data = NULL
 };
 
