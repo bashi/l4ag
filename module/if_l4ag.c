@@ -141,6 +141,7 @@ static int l4ag_sendrawpacket(struct l4conn *lc, struct sk_buff *skb,
     struct iphdr *iph;
     struct kvec iov;
     struct msghdr msg = { .msg_flags = flags };
+    struct socket *sock;
 
     skb_push(skb, sizeof(*iph));
     iph = (struct iphdr *)skb->data;
@@ -161,7 +162,8 @@ static int l4ag_sendrawpacket(struct l4conn *lc, struct sk_buff *skb,
 
     msg.msg_name = (struct sockaddr *)&lc->dsin;
     msg.msg_namelen = sizeof(lc->dsin);
-    len = kernel_sendmsg(lc->send_sock, &msg, &iov, 1, skb->len);
+    sock = lc->l4st->rawlc->recv_sock;  /* this is the only socket for raw. */
+    len = kernel_sendmsg(sock, &msg, &iov, 1, skb->len);
     DBG(KERN_INFO "l4ag: kernel_sendmsg returns %d\n", len);
     return len;
 }
@@ -1153,13 +1155,13 @@ static int l4conn_is_send_active(struct l4conn *lc)
         DBG(KERN_INFO "l4ag: sendactive: !L4CONN_SENDACTIVE\n");
         return 0;
     }
+    /* Raw l4conn does not have any socket. */
+    if (lc->l4st->flags & L4AG_RAWSOCKET)
+        return 1;
     if (!lc->send_sock) {
         DBG(KERN_INFO "l4ag: sendactive: !send_sock\n");
         return 0;
     }
-    /* Raw socket does not contain any state. */
-    if (lc->l4st->flags & L4AG_RAWSOCKET)
-        return 1;
     /* XXX umm.. we may need to accept other state. */
     if (lc->send_sock->sk->sk_state != TCP_ESTABLISHED) {
         DBG(KERN_INFO "l4ag: sendactive: !TCP_ESTABLISHED, state = %d\n",
@@ -1443,7 +1445,6 @@ static int l4ag_create_rawl4conn(struct l4ag_struct *ln,
                                  struct in_addr *raddr)
 {
     struct l4conn *lc;
-    int err, on = 1;
 
     lc = l4ag_create_l4conn(ln, 0);
     if (!lc) {
@@ -1451,18 +1452,10 @@ static int l4ag_create_rawl4conn(struct l4ag_struct *ln,
         return -ENOMEM;
     }
 
-    /* Create raw send socket */
-    err = sock_create_kern(AF_INET, SOCK_RAW, IPPROTO_L4AGRAW, &lc->send_sock);
-    if (err < 0) {
-        DBG(KERN_INFO "l4ag: Can't create raw send socket.\n");
-        goto out_free;
-    }
-    err = kernel_setsockopt(lc->send_sock, IPPROTO_IP, IP_HDRINCL,
-                            (char *)&on, sizeof(on));
-    if (err < 0) {
-        DBG(KERN_INFO "l4ag: Can't set socket option.\n");
-        goto out_free;
-    }
+    /*
+     * Raw l4conn is used as "address-pair storage".
+     * There is no socket.
+     */
 
     lc->ssin.sin_family = AF_INET;
     lc->ssin.sin_port = 0;
@@ -1482,9 +1475,6 @@ static int l4ag_create_rawl4conn(struct l4ag_struct *ln,
         l4ag_inaddr_dbgprint("  yaddr: ", &lc->dsin.sin_addr);
 
     return 0;
-out_free:
-    l4ag_delete_l4conn(ln, lc);
-    return err;
 }
 
 static int l4agctl_addraw_handler(struct l4ag_struct *ln, void *data, int len)
@@ -2431,7 +2421,6 @@ static int l4ag_sendpacket_rawab(struct l4ag_struct *ln)
 {
     struct sk_buff *skb;
     struct l4ag_ab_info *abinfo = ln->ops->private_data;
-    struct socket *send_sock;
     int len;
 
     if (!abinfo->primary_lc) {
@@ -2439,9 +2428,8 @@ static int l4ag_sendpacket_rawab(struct l4ag_struct *ln)
         return -ENOTCONN;
     }
 
-    send_sock = abinfo->primary_lc->send_sock;
-    if (!send_sock || !(abinfo->primary_lc->flags & L4CONN_SENDACTIVE)) {
-        DBG(KERN_INFO "l4ag: primary send_sock is not active.\n");
+    if (!(abinfo->primary_lc->flags & L4CONN_SENDACTIVE)) {
+        DBG(KERN_INFO "l4ag: primary l4conn is not active.\n");
         return -EINVAL;
     }
 
@@ -3085,7 +3073,12 @@ static int l4ag_set_priority(struct net *net, struct file *file,
     lc->pri = (int)ifr->ifr_data;
     ln->ops->change_priority(ln, lc);
     DBG(KERN_INFO "l4ag: set priority %d\n", lc->pri);
-    l4ag_sock_dbgprint(lc->send_sock);
+    if (ln->flags & L4AG_RAWSOCKET) {
+        l4ag_inaddr_dbgprint("  maddr: ", &lc->ssin.sin_addr);
+        l4ag_inaddr_dbgprint("  yaddr: ", &lc->dsin.sin_addr);
+    } else {
+        l4ag_sock_dbgprint(lc->send_sock);
+    }
 
     /* send ctlmsg */
     if ((ln->flags & L4AG_RAWSOCKET) || L4CONN_IS_ACTIVE(lc))
