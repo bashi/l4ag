@@ -1065,6 +1065,11 @@ static void l4ag_delete_l4conn(struct l4ag_struct *ln, struct l4conn *lc)
         sock_release(lc->send_sock);
         lc->send_sock = NULL;
     }
+    /* raw connection closing */
+    if (ln->flags & L4AG_RAWSOCKET) {
+        ln->ops->delete_sendsocket(ln, lc);
+    }
+
     kfree(lc);
     DBG(KERN_INFO "l4ag: delete l4conn struct.\n");
 }
