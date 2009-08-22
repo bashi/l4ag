@@ -57,6 +57,7 @@ static struct l4ag_struct *default_ln = NULL;   /* XXX just for test */
 static const struct ethtool_ops l4ag_ethtool_ops;
 
 static int l4agctl_send_delpeer_msg(struct l4conn *);
+static int l4agctl_send_delraw_msg(struct l4conn *);
 
 static inline void l4ag_inaddr_dbgprint(char *prefix, struct in_addr *addr)
 {
@@ -97,6 +98,19 @@ static inline void l4ag_sock_dbgprint(struct socket *sock)
 #endif
 }
 
+static inline void l4ag_iphdr_dbgprint(struct iphdr *iph)
+{
+#ifdef DEBUG
+    __u32 saddr = ntohl(iph->saddr), daddr = ntohl(iph->daddr);
+    DBG(KERN_INFO "  saddr:%d.%d.%d.%d\n",
+        (saddr >> 24), ((saddr >> 16)&0xff), ((saddr >> 8)&0xff),
+        (saddr & 0xff));
+    DBG(KERN_INFO "  daddr:%d.%d.%d.%d\n",
+        (daddr >> 24), ((daddr >> 16)&0xff), ((daddr >> 8)&0xff),
+        (daddr & 0xff));
+#endif
+}
+
 /* socket operations */
 static int l4ag_recvsock(struct socket *sock, unsigned char *buf,
                          int size, unsigned int flags)
@@ -116,6 +130,38 @@ static int l4ag_sendsock(struct socket *sock, unsigned char *buf,
     struct kvec iov = {buf, size};
     struct msghdr msg = { .msg_flags = flags };
     len = kernel_sendmsg(sock, &msg, &iov, 1, size);
+    DBG(KERN_INFO "l4ag: kernel_sendmsg returns %d\n", len);
+    return len;
+}
+
+static int l4ag_sendrawpacket(struct l4conn *lc, struct sk_buff *skb,
+                              unsigned int flags)
+{
+    int len;
+    struct iphdr *iph;
+    struct kvec iov;
+    struct msghdr msg = { .msg_flags = flags };
+
+    skb_push(skb, sizeof(*iph));
+    iph = (struct iphdr *)skb->data;
+    iph->version = 4;
+    iph->ihl = 5;
+    iph->tos = 0;
+    iph->tot_len = htons(skb->len);
+    iph->id = 0;
+    iph->frag_off = 0;
+    iph->ttl = 255;
+    iph->protocol = IPPROTO_L4AGRAW;
+    iph->check = 0;
+    iph->saddr = lc->ssin.sin_addr.s_addr;
+    iph->daddr = lc->dsin.sin_addr.s_addr;
+
+    iov.iov_base = skb->data;
+    iov.iov_len = skb->len;
+
+    msg.msg_name = (struct sockaddr *)&lc->dsin;
+    msg.msg_namelen = sizeof(lc->dsin);
+    len = kernel_sendmsg(lc->send_sock, &msg, &iov, 1, skb->len);
     DBG(KERN_INFO "l4ag: kernel_sendmsg returns %d\n", len);
     return len;
 }
@@ -826,12 +872,18 @@ static int l4ag_net_change_mtu(struct net_device *dev, int new_mtu)
 }
 
 /* Initialize net device. */
-static void l4ag_net_init(struct net_device *dev)
+static void l4ag_net_init(struct net_device *dev, struct l4ag_struct *ln)
 {
     /* Acts as L3 Point-to-Point device */
-    dev->hard_header_len = 0;
-    dev->addr_len = 0;
-    dev->mtu = 4096;
+    if (ln->flags & L4AG_RAWSOCKET) {
+        dev->hard_header_len = sizeof(struct iphdr);
+        dev->addr_len = 4;
+        dev->mtu = 1480;
+    } else {
+        dev->hard_header_len = 0;
+        dev->addr_len = 0;
+        dev->mtu = 4096;
+    }
     dev->change_mtu = l4ag_net_change_mtu;
     dev->type = ARPHRD_NONE;
     dev->flags = IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
@@ -951,7 +1003,7 @@ out:
     return err;
 }
 
-static struct l4conn *l4ag_create_l4conn(struct l4ag_struct *ln, int flags)
+static struct l4conn *l4conn_create(struct l4ag_struct *ln, int flags)
 {
     struct l4conn *lc;
 
@@ -966,16 +1018,28 @@ static struct l4conn *l4ag_create_l4conn(struct l4ag_struct *ln, int flags)
     lc->send_sock = NULL;
     lc->recv_thread = NULL;
     lc->private_data = NULL;
-    list_add(&lc->list, &ln->l4conn_list);
     DBG(KERN_INFO "l4ag: create l4conn struct.\n");
+    return lc;
+}
+
+static struct l4conn *l4ag_create_l4conn(struct l4ag_struct *ln, int flags)
+{
+    struct l4conn *lc;
+
+    lc = l4conn_create(ln, flags);
+    list_add(&lc->list, &ln->l4conn_list);
     return lc;
 }
 
 static void l4ag_delete_l4conn(struct l4ag_struct *ln, struct l4conn *lc)
 {
     /* notify close connection to the peer (if possible) */
-    if (lc->flags & L4CONN_ACTIVECLOSE)
-        l4agctl_send_delpeer_msg(lc);
+    if (lc->flags & L4CONN_ACTIVECLOSE) {
+        if (ln->flags & L4AG_RAWSOCKET)
+            l4agctl_send_delraw_msg(lc);
+        else
+            l4agctl_send_delpeer_msg(lc);
+    }
 
     /* XXX should use lock. */
     list_del(&lc->list);
@@ -984,14 +1048,16 @@ static void l4ag_delete_l4conn(struct l4ag_struct *ln, struct l4conn *lc)
     if (lc->recv_sock) {
         DBG(KERN_INFO "l4ag: shutting down recvsock...\n");
         ln->ops->delete_recvsocket(ln, lc);
-        tcp_disconnect(lc->send_sock->sk, 0);
+        if (!(ln->flags & L4AG_RAWSOCKET))
+            tcp_disconnect(lc->recv_sock->sk, 0);
         kernel_sock_shutdown(lc->recv_sock, SHUT_RDWR);
         /* lc->recv_sock will set to NULL when recv thread terminates. */
     }
     if (lc->send_sock) {
         DBG(KERN_INFO "l4ag: shutting down sendsock...\n");
         ln->ops->delete_sendsocket(ln, lc);
-        tcp_disconnect(lc->send_sock->sk, 0);
+        if (!(ln->flags & L4AG_RAWSOCKET))
+            tcp_disconnect(lc->send_sock->sk, 0);
         kernel_sock_shutdown(lc->send_sock, SHUT_RDWR);
         sock_release(lc->send_sock);
         lc->send_sock = NULL;
@@ -1037,20 +1103,26 @@ static struct l4conn *l4ag_get_l4conn_by_pair(struct l4ag_struct *ln,
 
     /* XXX should lock? */
     list_for_each_entry(lc, &ln->l4conn_list, list) {
-        err = l4conn_getsockname(lc, &addr);
-        if (err < 0) {
-            DBG(KERN_INFO "l4ag: couldn't get socket address.\n");
-            continue;
+        if (ln->flags & L4AG_RAWSOCKET) {
+            if (ADDR_EQUAL(laddr, &lc->ssin.sin_addr) &&
+                ADDR_EQUAL(raddr, &lc->dsin.sin_addr))
+                return lc;
+        } else {
+            err = l4conn_getsockname(lc, &addr);
+            if (err < 0) {
+                DBG(KERN_INFO "l4ag: couldn't get socket address.\n");
+                continue;
+            }
+            if (!ADDR_EQUAL(laddr, &addr.sin_addr))
+                continue;
+            err = l4conn_getpeername(lc, &addr);
+            if (err < 0) {
+                DBG(KERN_INFO "l4ag: couldn't get socket address.\n");
+                continue;
+            }
+            if (ADDR_EQUAL(raddr, &addr.sin_addr))
+                return lc;
         }
-        if (!ADDR_EQUAL(laddr, &addr.sin_addr))
-            continue;
-        err = l4conn_getpeername(lc, &addr);
-        if (err < 0) {
-            DBG(KERN_INFO "l4ag: couldn't get socket address.\n");
-            continue;
-        }
-        if (ADDR_EQUAL(raddr, &addr.sin_addr))
-            return lc;
     }
     DBG(KERN_INFO "l4ag: Can't find l4 connection.\n");
     return NULL;
@@ -1084,6 +1156,9 @@ static int l4conn_is_send_active(struct l4conn *lc)
         DBG(KERN_INFO "l4ag: sendactive: !send_sock\n");
         return 0;
     }
+    /* Raw socket does not contain any state. */
+    if (lc->l4st->flags & L4AG_RAWSOCKET)
+        return 1;
     /* XXX umm.. we may need to accept other state. */
     if (lc->send_sock->sk->sk_state != TCP_ESTABLISHED) {
         DBG(KERN_INFO "l4ag: sendactive: !TCP_ESTABLISHED, state = %d\n",
@@ -1136,11 +1211,16 @@ try_again:
         return -ENOTCONN;
     }
 
-    addrlen = sizeof(addr);
-    err = kernel_getpeername(lc->recv_sock, (struct sockaddr*)&addr, &addrlen);
-    if (err < 0) {
-        DBG(KERN_INFO "l4ag: can't get peername.\n");
-        return -EINVAL;
+    if (ln->flags & L4AG_RAWSOCKET) {
+        memcpy(&addr, &lc->dsin, sizeof(addr));
+    } else {
+        addrlen = sizeof(addr);
+        err = kernel_getpeername(lc->recv_sock, (struct sockaddr*)&addr,
+                                 &addrlen);
+        if (err < 0) {
+            DBG(KERN_INFO "l4ag: can't get peername.\n");
+            return -EINVAL;
+        }
     }
     addr.sin_port = htons(L4AGCTL_PORT);
 
@@ -1188,6 +1268,32 @@ static int l4agctl_send_delpeer_msg(struct l4conn *lc)
     return l4agctl_sendmsg(lc->l4st, &msg, sizeof(msg));
 }
 
+static int l4agctl_send_addraw_msg(struct l4conn *lc)
+{
+    struct l4agctl_addraw_msg msg;
+
+    L4AGCTL_INITMSG(msg, L4AGCTL_MSG_ADDRAW);
+    memcpy(&msg.yaddr, &lc->dsin.sin_addr, sizeof(msg.yaddr));
+    memcpy(&msg.maddr, &lc->ssin.sin_addr, sizeof(msg.maddr));
+    DBG(KERN_INFO "l4ag: sending addraw msg.\n");
+    l4ag_inaddr_dbgprint("  maddr: ", &msg.maddr);
+    l4ag_inaddr_dbgprint("  yaddr: ", &msg.yaddr);
+
+    return l4agctl_sendmsg(lc->l4st, &msg, sizeof(msg));
+}
+
+static int l4agctl_send_delraw_msg(struct l4conn *lc)
+{
+    struct l4agctl_delraw_msg msg;
+
+    L4AGCTL_INITMSG(msg, L4AGCTL_MSG_DELRAW);
+    memcpy(&msg.addr, &lc->ssin.sin_addr, sizeof(msg.addr));
+    DBG(KERN_INFO "l4ag: sending delraw msg.\n");
+    l4ag_inaddr_dbgprint("  addr: ", &msg.addr);
+
+    return l4agctl_sendmsg(lc->l4st, &msg, sizeof(msg));
+}
+
 static int l4agctl_send_setpri_msg(struct l4conn *lc)
 {
     struct sockaddr_in addr;
@@ -1195,24 +1301,31 @@ static int l4agctl_send_setpri_msg(struct l4conn *lc)
     int err, addrlen;
 
     DBG(KERN_INFO "l4ag: sending setpri msg.\n");
-    if (!L4CONN_IS_ACTIVE(lc))
+    if (!(lc->l4st->flags & L4AG_RAWSOCKET) && !L4CONN_IS_ACTIVE(lc))
         return -EINVAL;
 
     L4AGCTL_INITMSG(msg, L4AGCTL_MSG_SETPRI);
     msg.pri = htons(lc->pri);
     addrlen = sizeof(addr);
-    err = kernel_getsockname(lc->send_sock, (struct sockaddr*)&addr, &addrlen);
-    if (err < 0) {
-        DBG(KERN_INFO "l4ag: can't get sockname, failed to send ctlmsg.\n");
-        return err;
+    if (lc->l4st->flags & L4AG_RAWSOCKET) {
+        memcpy(&msg.maddr, &lc->ssin.sin_addr, sizeof(msg.maddr));
+        memcpy(&msg.yaddr, &lc->dsin.sin_addr, sizeof(msg.yaddr));
+    } else {
+        err = kernel_getsockname(lc->send_sock,
+                             (struct sockaddr*)&addr, &addrlen);
+        if (err < 0) {
+            DBG(KERN_INFO "l4ag: can't get sockname, failed to send ctlmsg.\n");
+            return err;
+        }
+        memcpy(&msg.maddr, &addr.sin_addr, sizeof(msg.maddr));
+        err = kernel_getpeername(lc->send_sock, (struct sockaddr*)&addr,
+                                 &addrlen);
+        if (err < 0) {
+            DBG(KERN_INFO "l4ag: can't get peername, failed to send ctlmsg.\n");
+            return err;
+        }
+        memcpy(&msg.yaddr, &addr.sin_addr, sizeof(msg.yaddr));
     }
-    memcpy(&msg.maddr, &addr.sin_addr, sizeof(msg.maddr));
-    err = kernel_getpeername(lc->send_sock, (struct sockaddr*)&addr, &addrlen);
-    if (err < 0) {
-        DBG(KERN_INFO "l4ag: can't get peername, failed to send ctlmsg.\n");
-        return err;
-    }
-    memcpy(&msg.yaddr, &addr.sin_addr, sizeof(msg.yaddr));
 
     err = l4agctl_sendmsg(lc->l4st, &msg, sizeof(msg));
     return err;
@@ -1324,11 +1437,113 @@ static int l4agctl_setpri_handler(struct l4ag_struct *ln, void *data, int len)
     return 0;
 }
 
+static int l4ag_create_rawl4conn(struct l4ag_struct *ln,
+                                 struct in_addr *laddr,
+                                 struct in_addr *raddr)
+{
+    struct l4conn *lc;
+    int err, on = 1;
+
+    lc = l4ag_create_l4conn(ln, 0);
+    if (!lc) {
+        DBG(KERN_INFO "l4ag: Can't allocate l4conn.\n");
+        return -ENOMEM;
+    }
+
+    /* Create raw send socket */
+    err = sock_create_kern(AF_INET, SOCK_RAW, IPPROTO_L4AGRAW, &lc->send_sock);
+    if (err < 0) {
+        DBG(KERN_INFO "l4ag: Can't create raw send socket.\n");
+        goto out_free;
+    }
+    err = kernel_setsockopt(lc->send_sock, IPPROTO_IP, IP_HDRINCL,
+                            (char *)&on, sizeof(on));
+    if (err < 0) {
+        DBG(KERN_INFO "l4ag: Can't set socket option.\n");
+        goto out_free;
+    }
+
+    lc->ssin.sin_family = AF_INET;
+    lc->ssin.sin_port = 0;
+    memcpy(&lc->ssin.sin_addr, laddr, sizeof(*laddr));
+    lc->dsin.sin_family = AF_INET;
+    lc->dsin.sin_port = 0;
+    if (raddr) {
+        memcpy(&lc->dsin.sin_addr, raddr, sizeof(*raddr));
+        lc->flags |= L4CONN_SENDACTIVE | L4CONN_PASSIVEOPEN;
+    } else {
+        lc->flags |= L4CONN_ACTIVEOPEN;
+    }
+
+    DBG(KERN_INFO "l4ag: create raw connection.\n");
+    l4ag_inaddr_dbgprint("  maddr: ", &lc->ssin.sin_addr);
+    if (raddr)
+        l4ag_inaddr_dbgprint("  yaddr: ", &lc->dsin.sin_addr);
+
+    return 0;
+out_free:
+    l4ag_delete_l4conn(ln, lc);
+    return err;
+}
+
+static int l4agctl_addraw_handler(struct l4ag_struct *ln, void *data, int len)
+{
+    struct l4agctl_addraw_msg *msg = (struct l4agctl_addraw_msg *)data;
+
+    DBG(KERN_INFO "l4ag: receive addraw ctlmsg.\n");
+    if (len != sizeof(*msg) || !(ln->flags & L4AG_RAWSOCKET))
+        return -EINVAL;
+
+    return l4ag_create_rawl4conn(ln, &msg->yaddr, &msg->maddr);
+}
+
+static int l4ag_delete_rawl4conn(struct l4ag_struct *ln,
+                                 struct in_addr *target, int is_local)
+{
+    struct l4conn *lc;
+    struct in_addr *addr;
+
+retry:
+    list_for_each_entry(lc, &ln->l4conn_list, list) {
+        if (is_local)
+            addr = &lc->ssin.sin_addr;
+        else
+            addr = &lc->dsin.sin_addr;
+
+        if (ADDR_EQUAL(target, addr)) {
+            if (is_local)
+                lc->flags |= L4CONN_ACTIVECLOSE;
+            else
+                lc->flags |= L4CONN_PASSIVECLOSE;
+            DBG(KERN_INFO "l4ag: deleting raw connection.\n");
+            l4ag_inaddr_dbgprint("  addr: ", addr);
+            l4ag_delete_l4conn(ln, lc);
+            goto retry;
+        }
+    }
+    return 0;
+}
+
+static int l4agctl_delraw_handler(struct l4ag_struct *ln, void *data, int len)
+{
+    struct l4agctl_delraw_msg *msg = (struct l4agctl_delraw_msg *)data;
+
+    if (len != sizeof(*msg) || !(ln->flags & L4AG_RAWSOCKET))
+        return -EINVAL;
+
+    DBG(KERN_INFO "l4ag: receive delraw ctlmsg.\n");
+    l4ag_inaddr_dbgprint("  remote addr: ", &msg->addr);
+
+    return l4ag_delete_rawl4conn(ln, &msg->addr, 0);
+}
+
 static struct l4agctl_msghandler {
     int (*handler)(struct l4ag_struct *, void *, int);
 } l4agctl_msghandlers[] = {
     { l4agctl_delpeer_handler },    /* L4AGCTL_MSG_DELPEER */
     { l4agctl_setpri_handler },     /* L4AGCTL_MSG_SETPRI */
+    { l4agctl_addraw_handler },     /* L4AGCTL_MSG_ADDRAW */
+    { l4agctl_delraw_handler },     /* L4AGCTL_MSG_DELRAW */
 };
 
 static int l4agctl_recvthread(void *arg)
@@ -2072,6 +2287,128 @@ static struct l4ag_operations __attribute__((unused)) l4ag_rb_ops = {
     .private_data = NULL
 };
 
+/* active/backup recv/send operation for raw socket */
+
+static int l4ag_recvpacket_rawab(struct l4ag_struct *ln, struct l4conn *lc)
+{
+    struct sk_buff *skb;
+    struct iphdr *oiph, *iiph;
+    int pktlen, hdrlen, plen;
+
+    while (lc->recvlen > 0) {
+        if ((lc->recvdata[0] & 0xf0) != 0x40) {
+            /* Not IPv4 packet */
+            DBG(KERN_INFO "l4ag: invalid outer packet, discard.\n");
+            l4cb_reset(lc);
+            break;
+        }
+        oiph = (struct iphdr *)lc->recvdata;
+        pktlen = ntohs(oiph->tot_len);
+        if (pktlen > lc->recvlen)
+            goto out_partial;
+
+        /* Decapsulate packet */
+        hdrlen = oiph->ihl << 2;
+        plen = pktlen - hdrlen;
+        DBG(KERN_INFO "l4ag: rawpkt outer, len = %d, hlen = %d\n",
+            pktlen, hdrlen);
+        l4ag_iphdr_dbgprint(oiph);
+
+        iiph = (struct iphdr *)(lc->recvdata + hdrlen);
+        if (iiph->version != 4) {
+            /* Not IPv4 packet */
+            DBG(KERN_INFO "l4ag: invalid inner packet, discard.\n");
+            l4cb_pull(lc, pktlen);
+            break;
+        }
+        DBG(KERN_INFO "l4ag: rawpkt inner, len = %d\n", plen);
+        l4ag_iphdr_dbgprint(iiph);
+
+        if (!(skb = alloc_skb(plen, GFP_KERNEL))) {
+            DBG(KERN_INFO "l4ag: coudln't allocate skb.\n");
+            ln->dev->stats.rx_dropped++;
+            l4cb_pull(lc, pktlen);
+            return -ENOMEM;
+        }
+
+        skb_copy_to_linear_data(skb, lc->recvdata + hdrlen, plen);
+        skb_put(skb, plen);
+        skb->ip_summed = CHECKSUM_UNNECESSARY;
+        skb_reset_mac_header(skb);
+        skb->protocol = htons(ETH_P_IP);
+        skb->dev = ln->dev;
+
+        netif_rx_ni(skb);
+
+        ln->dev->last_rx = jiffies;
+        ln->dev->stats.rx_packets++;
+        ln->dev->stats.rx_bytes += plen;
+
+        l4cb_pull(lc, pktlen);
+    }
+
+    return 0;
+
+out_partial:
+    DBG(KERN_DEBUG "l4ag: partial received, pull up.\n");
+    l4cb_pullup(lc);
+    return 0;
+}
+
+static int l4ag_sendpacket_rawab(struct l4ag_struct *ln)
+{
+    struct sk_buff *skb;
+    struct l4ag_ab_info *abinfo = ln->ops->private_data;
+    struct socket *send_sock;
+    int len;
+
+    if (!abinfo->primary_lc) {
+        DBG(KERN_INFO "l4ag: no l4 connection.\n");
+        return -ENOTCONN;
+    }
+
+    send_sock = abinfo->primary_lc->send_sock;
+    if (!send_sock || !(abinfo->primary_lc->flags & L4CONN_SENDACTIVE)) {
+        DBG(KERN_INFO "l4ag: primary send_sock is not active.\n");
+        return -EINVAL;
+    }
+
+    DBG(KERN_INFO "l4ag: active/backup raw send\n");
+
+    while ((skb = skb_dequeue(&ln->sendq))) {
+retry:
+        len = l4ag_sendrawpacket(abinfo->primary_lc, skb, 0);
+        if (len < 0) {
+            printk(KERN_INFO "l4ag: failed to send message\n");
+            return len;
+        }
+        if (len != skb->len) {
+            ln->dev->stats.tx_bytes += len;
+            skb_pull(skb, len);
+            goto retry;
+        }
+        ln->dev->stats.tx_packets++;
+        ln->dev->stats.tx_bytes += len;
+        kfree_skb(skb);
+    }
+
+    return 0;
+}
+
+static struct l4ag_operations __attribute__((unused)) l4ag_rawab_ops = {
+    .init = l4ag_init_ab,
+    .release = l4ag_release_ab,
+    .add_recvsocket = l4ag_add_socket_ab,
+    .add_sendsocket = l4ag_add_socket_ab,
+    .delete_recvsocket = l4ag_delete_socket_ab,
+    .delete_sendsocket = l4ag_delete_socket_ab,
+    .change_priority = l4ag_change_priority_ab,
+    .recvpacket = l4ag_recvpacket_rawab,
+    .sendpacket = l4ag_sendpacket_rawab,
+    .get_primary_sendsock = l4ag_get_primary_sendsock_generic,
+    .private_data = NULL,
+};
+
 /* Receiver thread */
 static int l4ag_recvthread(void *arg)
 {
@@ -2090,7 +2427,7 @@ static int l4ag_recvthread(void *arg)
             if (len == 0)
                 break;
             if (len < 0) {
-                printk(KERN_INFO "kernel_recvmsg failed with code %d.", len);
+                printk(KERN_INFO "kernel_recvmsg failed with code %d.\n", len);
                 err = len;
                 break;
             }
@@ -2308,8 +2645,53 @@ out_release:
     return err;
 }
 
+static void l4ag_delete_rawrecvconn(struct l4ag_struct *ln)
+{
+    if (ln->rawlc->recv_sock) {
+        kernel_sock_shutdown(ln->rawlc->recv_sock, SHUT_RDWR);
+    }
+    kfree(ln->rawlc);
+    ln->rawlc = NULL;
+    DBG(KERN_INFO "l4ag: delete raw l4conn.\n");
+}
+
+static int l4ag_create_rawrecvconn(struct l4ag_struct *ln)
+{
+    int err, on = 1;
+
+    ln->rawlc = l4conn_create(ln, 0);
+    if (!ln->rawlc) {
+        return -ENOMEM;
+    }
+    err  = sock_create_kern(AF_INET, SOCK_RAW,
+                            IPPROTO_L4AGRAW, &ln->rawlc->recv_sock);
+    if (err < 0) {
+        DBG(KERN_INFO "l4ag: Can't create rawrecv socket.\n");
+        goto out_free;
+    }
+    err = kernel_setsockopt(ln->rawlc->recv_sock, IPPROTO_IP, IP_HDRINCL,
+                            (char *)&on, sizeof(on));
+    if (err < 0) {
+        DBG(KERN_INFO "l4ag: Can't set socket option.\n");
+        goto out_free;
+    }
+
+    l4ag_start_kthread(&ln->rawlc->recv_thread, l4ag_recvthread,
+                       ln->rawlc, "kl4agrr");
+    if (ln->rawlc->recv_thread == ERR_PTR(-ENOMEM)) {
+        DBG(KERN_INFO "l4ag: failed to start recv thread.\n");
+        err = -ENOMEM;
+        goto out_free;
+    }
+
+    return 0;
+out_free:
+    l4ag_delete_rawrecvconn(ln);
+    return err;
+}
+
 static int l4ag_create_device(struct net *net, struct file *file,
-                              struct ifreq *ifr)
+                              struct ifreq *ifr, int rawsocket)
 {
     struct l4ag_net *lnet;
     struct l4ag_struct *ln;
@@ -2345,18 +2727,32 @@ static int l4ag_create_device(struct net *net, struct file *file,
     skb_queue_head_init(&ln->sendq);
     init_completion(&ln->sendq_comp);
     INIT_LIST_HEAD(&ln->l4conn_list);
-    ln->ops = &l4ag_ab_ops; // XXX should define default operations
+    // XXX should define default operations
+    if (rawsocket) {
+        ln->ops = &l4ag_rawab_ops;
+        ln->flags |= L4AG_RAWSOCKET;
+    } else {
+        ln->ops = &l4ag_ab_ops;
+    }
     default_ln = ln;    // XXX just for test
 
     err = ln->ops->init(ln);
     if (err < 0)
         goto err_free_dev;
 
-    /* Start accept thread */
-    l4ag_start_kthread(&ln->accept_thread, l4ag_accept_thread, ln, "kl4agac");
-    if (ln->accept_thread == ERR_PTR(-ENOMEM)) {
-        err = -ENOMEM;
-        goto err_free_dev;
+    if (rawsocket) {
+        /* Create raw recv socket */
+        err = l4ag_create_rawrecvconn(ln);
+        if (err < 0)
+            goto err_free_dev;
+    } else {
+        /* Start accept thread */
+        l4ag_start_kthread(&ln->accept_thread, l4ag_accept_thread,
+                           ln, "kl4agac");
+        if (ln->accept_thread == ERR_PTR(-ENOMEM)) {
+            err = -ENOMEM;
+            goto err_free_dev;
+        }
     }
 
     /* Start ctl thread */
@@ -2369,7 +2765,7 @@ static int l4ag_create_device(struct net *net, struct file *file,
     /* Start send thread, this might wrong place to do it..*/
     l4ag_start_kthread(&ln->send_thread, l4ag_sendthread, ln, "kl4agtx");
 
-    l4ag_net_init(dev);
+    l4ag_net_init(dev, ln);
 
     if (strchr(dev->name, '%')) {
         err = dev_alloc_name(dev, dev->name);
@@ -2437,6 +2833,9 @@ static int l4ag_delete_device(struct net *net, struct file *file,
         DBG(KERN_INFO "l4ag: shutting down ctlsock...\n");
         kernel_sock_shutdown(ln->ctl_sock, SHUT_RDWR);
     }
+    if ((ln->flags & L4AG_RAWSOCKET) && ln->rawlc) {
+        l4ag_delete_rawrecvconn(ln);
+    }
 
     /* Stop sender thread. */
     if (ln->send_thread)
@@ -2490,6 +2889,62 @@ out:
     return err;
 }
 
+static int l4ag_set_rawaddr(struct net *net, struct file *file,
+                            struct ifreq *ifr)
+{
+    struct l4ag_net *lnet;
+    struct l4ag_struct *ln;
+    struct in_addr *addr;
+    int err;
+
+    lnet = net_generic(current->nsproxy->net_ns, l4ag_net_id);
+    ln = l4ag_get_by_name(lnet, ifr->ifr_name);
+    if (!ln)
+        return -EINVAL;
+
+    /* active connection establishment. */
+    DBG(KERN_INFO "l4ag: set rawaddr.\n");
+    addr = &(((struct sockaddr_in *)&ifr->ifr_addr)->sin_addr);
+    l4ag_sockaddr_dbgprint("  laddr: ", &ifr->ifr_addr);
+    /* create raw connection. The connection is not active at this moment.
+       the connection will be active when set peer address. */
+    err = l4ag_create_rawl4conn(ln, addr, NULL);
+    return err;
+}
+
+static int l4ag_set_rawpeer(struct net *net, struct file *file,
+                            struct ifreq *ifr)
+{
+    struct l4ag_net *lnet;
+    struct l4ag_struct *ln;
+    struct l4conn *lc;
+    struct in_addr *addr;
+
+    lnet = net_generic(current->nsproxy->net_ns, l4ag_net_id);
+    ln = l4ag_get_by_name(lnet, ifr->ifr_name);
+    if (!ln)
+        return -EINVAL;
+
+    DBG(KERN_INFO "l4ag: set rawpeer.\n");
+    addr = &(((struct sockaddr_in *)&ifr->ifr_addr)->sin_addr);
+    l4ag_sockaddr_dbgprint("  raddr: ", &ifr->ifr_addr);
+
+    /* lookup half-opened raw connection. */
+    list_for_each_entry(lc, &ln->l4conn_list, list) {
+        if ((lc->flags & L4CONN_ACTIVEOPEN) &&
+            !(lc->flags & L4CONN_SENDACTIVE))
+            break;
+    }
+    if (!lc)
+        return -EINVAL;
+
+    memcpy(&lc->dsin.sin_addr, addr, sizeof(*addr));
+    lc->flags |= L4CONN_SENDACTIVE;
+
+    /* sending addraw message */
+    return l4agctl_send_addraw_msg(lc);
+}
+
 static int l4ag_delete_addr(struct net *net, struct file *file,
                             struct ifreq *ifr)
 {
@@ -2506,6 +2961,7 @@ static int l4ag_delete_addr(struct net *net, struct file *file,
 
     DBG(KERN_INFO "l4ag: delete addr request.\n");
 
+    /* XXX this might not be needed.. */
     /* send delpeer message to the peer. */
     sin = (struct sockaddr_in *)&ifr->ifr_addr;
     L4AGCTL_INITMSG(msg, L4AGCTL_MSG_DELPEER);
@@ -2516,6 +2972,25 @@ static int l4ag_delete_addr(struct net *net, struct file *file,
 
     /* deleting local connection */
     return l4ag_delpeer(ln, &sin->sin_addr, 1);
+}
+
+static int l4ag_delete_rawaddr(struct net *net, struct file *file,
+                               struct ifreq *ifr)
+{
+    struct l4ag_net *lnet;
+    struct l4ag_struct *ln;
+    struct sockaddr_in *sin;
+
+    lnet = net_generic(current->nsproxy->net_ns, l4ag_net_id);
+    ln = l4ag_get_by_name(lnet, ifr->ifr_name);
+    if (!ln)
+        return -EINVAL;
+
+    DBG(KERN_INFO "l4ag: delete rawaddr request.\n");
+
+    sin = (struct sockaddr_in *)&ifr->ifr_addr;
+    /* deleting local connection */
+    return l4ag_delete_rawl4conn(ln, &sin->sin_addr, 1);
 }
 
 static int l4ag_set_priority(struct net *net, struct file *file,
@@ -2541,7 +3016,7 @@ static int l4ag_set_priority(struct net *net, struct file *file,
     l4ag_sock_dbgprint(lc->send_sock);
 
     /* send ctlmsg */
-    if (L4CONN_IS_ACTIVE(lc))
+    if ((ln->flags & L4AG_RAWSOCKET) || L4CONN_IS_ACTIVE(lc))
         l4agctl_send_setpri_msg(lc);
     else
         lc->flags |= L4CONN_SETPRI_PENDING;
@@ -2593,10 +3068,11 @@ static int l4ag_fops_ioctl(struct inode *inode, struct file *file,
     if (copy_from_user(&ifr, argp, sizeof(ifr)))
         return -EFAULT;
 
-    if (cmd == L4AGIOCCREATE) {
+    if (cmd == L4AGIOCCREATE || cmd == L4AGIOCRAWCREATE) {
         ifr.ifr_name[IFNAMSIZ-1] = '\0';
         rtnl_lock();
-        err = l4ag_create_device(current->nsproxy->net_ns, file, &ifr);
+        err = l4ag_create_device(current->nsproxy->net_ns, file,
+                                 &ifr, cmd == L4AGIOCCREATE ? 0 : 1);
         rtnl_unlock();
         if (err)
             return err;
@@ -2623,6 +3099,22 @@ static int l4ag_fops_ioctl(struct inode *inode, struct file *file,
         return err;
     }
 
+    if (cmd == L4AGIOCRAWADDR) {
+        ifr.ifr_name[IFNAMSIZ-1] = '\0';
+        rtnl_lock();
+        err = l4ag_set_rawaddr(current->nsproxy->net_ns, file, &ifr);
+        rtnl_unlock();
+        return err;
+    }
+
+    if (cmd == L4AGIOCRAWPEER) {
+        ifr.ifr_name[IFNAMSIZ-1] = '\0';
+        rtnl_lock();
+        err = l4ag_set_rawpeer(current->nsproxy->net_ns, file, &ifr);
+        rtnl_unlock();
+        return err;
+    }
+
     if (cmd == L4AGIOCSPRI) {
         ifr.ifr_name[IFNAMSIZ-1] = '\0';
         rtnl_lock();
@@ -2635,6 +3127,14 @@ static int l4ag_fops_ioctl(struct inode *inode, struct file *file,
         ifr.ifr_name[IFNAMSIZ-1] = '\0';
         rtnl_lock();
         err = l4ag_delete_addr(current->nsproxy->net_ns, file, &ifr);
+        rtnl_unlock();
+        return err;
+    }
+
+    if (cmd == L4AGIOCRAWDELADDR) {
+        ifr.ifr_name[IFNAMSIZ-1] = '\0';
+        rtnl_lock();
+        err = l4ag_delete_rawaddr(current->nsproxy->net_ns, file, &ifr);
         rtnl_unlock();
         return err;
     }

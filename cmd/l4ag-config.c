@@ -26,10 +26,12 @@
 void usage() {
     char *lines[] = {
         "usage:",
-        "  l4ag-config create [-p <portnum>] [<ifname>]",
+        "  l4ag-config create [-p <portnum>] [-r] [<ifname>]",
         "  l4ag-config delete <ifname>",
         "  l4ag-config peer [-s <ifname>] [-P <priority>] <ifname> <addr> [<portnum>]",
         "  l4ag-config deladdr <ifname> <addr>",
+        "  l4ag-config rawaddr [-s <ifname>] [-P <priority>] <ifname> <addr>",
+        "  l4ag-config delrawaddr <ifname> <addr>",
         "  l4ag-config algorithm <ifname> <algorithm>",
         "    <algorithm> = generic | actstby | rr | rtt-based",
         NULL
@@ -48,18 +50,28 @@ int create_device(int argc, char **argv)
 {
     char *dev;
     int portnum = L4AG_DEFAULTPORT;
+    int rawsock = 0;
 
-    if (argc > 1 && (strcmp(argv[0], "-p") == 0)) {
-        portnum = atoi(argv[1]);
-        argc -= 2;
-        argv += 2;
+    while (argc >= 1) {
+        if (strcmp(argv[0], "-p") == 0) {
+            portnum = atoi(argv[1]);
+            argc -= 2;
+            argv += 2;
+        }
+        else if (strcmp(argv[0], "-r") == 0) {
+            rawsock = 1;
+            argc -= 1;
+            argv += 1;
+        } else {
+            break;
+        }
     }
 
     if (argc >= 1)
         dev = argv[0];
     else
         dev = NULL;
-    return l4agctl_createdevice_cmd(dev, portnum);
+    return l4agctl_createdevice_cmd(dev, portnum, rawsock);
 }
 
 int delete_device(int argc, char **argv)
@@ -69,10 +81,31 @@ int delete_device(int argc, char **argv)
     return l4agctl_deletedevice_cmd(argv[0]);
 }
 
+static int getsockaddr_in(char *host, struct sockaddr_in *sin)
+{
+    struct addrinfo hints, *res;
+    int ret;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    ret = getaddrinfo(host, NULL, &hints, &res);
+    if (ret) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(ret));
+        return -1;
+    }
+
+    if (res == NULL)
+        return -1;
+
+    /* XXX assume first addrinfo is the best information */
+    memcpy(sin, res->ai_addr, sizeof(*sin));
+    freeaddrinfo(res);
+    return 0;
+}
+
 int set_peer(int argc, char **argv)
 {
-    struct sockaddr_in *addr;
-    struct addrinfo hints, *res;
+    struct sockaddr_in addr;
     char *dev = NULL, *fromdev = NULL;
     int ret, priority = 0;
 
@@ -97,28 +130,14 @@ int set_peer(int argc, char **argv)
     if (argc != 2) exit_with_usage();
     dev = argv[0];
 
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    ret = getaddrinfo(argv[1], NULL, &hints, &res);
-    if (ret) {
-        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(ret));
-        return -1;
-    }
-
-    if (res == NULL)
-        return -1;
-
-    /* XXX assume first addrinfo is the best information */
-    addr = (struct sockaddr_in *)res->ai_addr;
-    printf("set peer, addr: %s\n", inet_ntoa(addr->sin_addr));
+    ret = getsockaddr_in(argv[1], &addr);
+    printf("set peer, addr: %s\n", inet_ntoa(addr.sin_addr));
     if (argc > 2) {
-        addr->sin_port = htons(atoi(argv[2]));
+        addr.sin_port = htons(atoi(argv[2]));
     } else {
-        addr->sin_port = htons(L4AG_DEFAULTPORT);
+        addr.sin_port = htons(L4AG_DEFAULTPORT);
     }
-    ret = l4agctl_setpeer_cmd(dev, addr, fromdev);
-    freeaddrinfo(res);
+    ret = l4agctl_setpeer_cmd(dev, &addr, fromdev);
     if (ret < 0)
         return ret;
     if (priority > 0)
@@ -134,7 +153,7 @@ int delete_addr(int argc, char **argv)
 
     if (argc != 2)
         exit_with_usage();
-    
+
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -153,6 +172,77 @@ int delete_addr(int argc, char **argv)
     ret = l4agctl_deladdr_cmd(argv[0], &addr->sin_addr);
     freeaddrinfo(res);
     return ret;
+}
+
+int set_rawaddr(int argc, char **argv)
+{
+    struct sockaddr_in ssin, dsin;
+    char *dev, *fromdev = NULL;
+    int ret, priority = 0;
+
+    while (argc > 2 && (*argv)[0] == '-') {
+        switch ((*argv)[1]) {
+        case 's':
+            fromdev = *(++argv);
+            argc--;
+            printf("src device = %s\n", fromdev);
+            break;
+        case 'P':
+            priority = atoi(*(++argv));
+            argc--;
+            printf("priority = %d\n", priority);
+            break;
+        default:
+            exit_with_usage();
+        }
+        argc--; argv++;
+    }
+
+    if (argc != 2) exit_with_usage();
+    if (!fromdev) {
+        fprintf(stderr, "-s option must specify in this operation.\n");
+        exit_with_usage();
+    }
+
+    dev = argv[0];
+
+    ret = getsockaddr_in(argv[1], &dsin);
+    if (ret < 0)
+        return ret;
+    ret = getsockaddrbyifname(fromdev, &ssin);
+    if (ret < 0)
+        return ret;
+    printf("raw, local: %s, remote %s\n",
+           inet_ntoa(ssin.sin_addr), inet_ntoa(dsin.sin_addr));
+
+    /* create raw connection */
+    ret = l4agctl_setrawaddr_cmd(dev, &ssin);
+    if (ret < 0) {
+        fprintf(stderr, "Can't create raw connection.\n");
+        return ret;
+    }
+    ret = l4agctl_setrawpeer_cmd(dev, &dsin);
+    if (ret < 0) {
+        fprintf(stderr, "Can't set peer address for raw connection.\n");
+        l4agctl_delrawaddr_cmd(dev, &ssin.sin_addr);
+        return ret;
+    }
+    if (priority > 0)
+        ret = l4agctl_setpri_cmd(dev, priority);
+    return ret;
+}
+
+int delete_rawaddr(int argc, char **argv)
+{
+    struct sockaddr_in addr;
+    int ret;
+
+    if (argc != 2)
+        exit_with_usage();
+    ret = getsockaddr_in(argv[1], &addr);
+    if (ret < 0)
+        return ret;
+    return l4agctl_delrawaddr_cmd(argv[0], &addr.sin_addr);
 }
 
 char *algorithm_names[] = {
@@ -188,6 +278,8 @@ struct l4ag_operations {
     { "delete", delete_device },
     { "peer", set_peer },
     { "deladdr", delete_addr },
+    { "rawaddr", set_rawaddr },
+    { "delrawaddr", delete_rawaddr },
     { "algorithm", set_algorithm },
     { NULL, NULL }
 };

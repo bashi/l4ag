@@ -54,6 +54,16 @@ int getifindexbyname(char *ifname)
     return ifr.ifr_ifindex;
 }
 
+int getsockaddrbyifname(char *ifname, struct sockaddr_in *sin)
+{
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+    if (do_ifrequest(SIOCGIFADDR, &ifr) < 0) return -1;
+    memcpy(sin, &ifr.ifr_addr, sizeof(*sin));
+    return 0;
+}
+
 static int do_ioctl(int cmd, struct ifreq *ifr)
 {
     int fd;
@@ -202,15 +212,20 @@ int set_default_dev(char *dev)
     return err;
 }
 
-int l4agctl_createdevice_cmd(char *dev, int portnum)
+int l4agctl_createdevice_cmd(char *dev, int portnum, int rawsock)
 {
     struct ifreq ifr;
+    int cmd;
 
     memset(&ifr, 0, sizeof(ifr));
     if (dev)
         strncpy(ifr.ifr_name, dev, IFNAMSIZ);
     *((int*)&ifr.ifr_data) = portnum;
-    return do_ioctl(L4AGIOCCREATE, &ifr);
+    if (rawsock)
+        cmd = L4AGIOCRAWCREATE;
+    else
+        cmd = L4AGIOCCREATE;
+    return do_ioctl(cmd, &ifr);
 }
 
 int l4agctl_deletedevice_cmd(char *dev)
@@ -260,6 +275,45 @@ int l4agctl_deladdr_cmd(char *dev, struct in_addr *addr)
     sin = (struct sockaddr_in*)&ifr.ifr_addr;
     memcpy(&sin->sin_addr, addr, sizeof(*addr));
     return do_ioctl(L4AGIOCDELADDR, &ifr);
+}
+
+int l4agctl_setrawaddr_cmd(char *dev, struct sockaddr_in *sin)
+{
+    struct ifreq ifr;
+    int ret;
+
+    memset(&ifr, 0, sizeof(ifr));
+    if (dev)
+        strncpy(ifr.ifr_name, dev, IFNAMSIZ);
+    memcpy(&ifr.ifr_addr, sin, sizeof(*sin));
+    ret = do_ioctl(L4AGIOCRAWADDR, &ifr);
+    return ret;
+}
+
+int l4agctl_setrawpeer_cmd(char *dev, struct sockaddr_in *sin)
+{
+    struct ifreq ifr;
+    int ret;
+
+    memset(&ifr, 0, sizeof(ifr));
+    if (dev)
+        strncpy(ifr.ifr_name, dev, IFNAMSIZ);
+    memcpy(&ifr.ifr_addr, sin, sizeof(*sin));
+    ret = do_ioctl(L4AGIOCRAWPEER, &ifr);
+    return ret;
+}
+
+int l4agctl_delrawaddr_cmd(char *dev, struct in_addr *addr)
+{
+    struct ifreq ifr;
+    struct sockaddr_in *sin;
+
+    memset(&ifr, 0, sizeof(ifr));
+    if (dev)
+        strncpy(ifr.ifr_name, dev, IFNAMSIZ);
+    sin = (struct sockaddr_in*)&ifr.ifr_addr;
+    memcpy(&sin->sin_addr, addr, sizeof(*addr));
+    return do_ioctl(L4AGIOCRAWDELADDR, &ifr);
 }
 
 int l4agctl_setalgorithm_cmd(char *dev, int index)
