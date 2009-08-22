@@ -107,20 +107,44 @@ struct dev_list *dev_list_high_priority(struct dev_list *head)
  */
 struct l4agmon {
     char ifname[IFNAMSIZ];
+    int rawsock;
     struct sockaddr_in paddr;
     struct dev_list *active_devices;
 };
 
 void l4agmon_addr_assigned(struct l4agmon *lm, char *dev, struct in_addr *addr)
 {
+    struct sockaddr_in ssin;
     int err, pri, ifindex;
 
     printf("creating connection associated, local addr %s ...\n",
            inet_ntoa(*addr));
 
-    err = l4agctl_setpeer_cmd(lm->ifname, &lm->paddr, dev);
+    if (lm->rawsock) {
+        ssin.sin_family = AF_INET;
+        ssin.sin_port = 0;
+        memcpy(&ssin.sin_addr, addr, sizeof(*addr));
+        err = l4agctl_setrawaddr_cmd(lm->ifname, &ssin);
+        if (err < 0) {
+            fprintf(stderr, "Can't set rawaddr.\n");
+            return;
+        }
+        err = l4agctl_setrawpeer_cmd(lm->ifname, &lm->paddr);
+        if (err < 0) {
+            fprintf(stderr, "Can't set rawpeer.\n");
+            return;
+        }
+    } else {
+        err = l4agctl_setpeer_cmd(lm->ifname, &lm->paddr, dev);
+        if (err < 0) {
+            fprintf(stderr, "Can't set peer.\n");
+            return;
+        }
+    }
+    /* set devname */
+    err = l4agctl_setdev_cmd(lm->ifname, dev);
     if (err < 0) {
-        fprintf(stderr, "Can't set peer.\n");
+        fprintf(stderr, "Can't set fromdev.\n");
         return;
     }
     /* set priority */
@@ -143,7 +167,10 @@ void l4agmon_addr_deleted(struct l4agmon *lm, char *dev, struct in_addr *addr)
     /* XXX We will need to add default gateway address for wlan and eth */
     if (dl)
         set_default_dev(dl->ifname);
-    l4agctl_deladdr_cmd(lm->ifname, addr);
+    if (lm->rawsock)
+        l4agctl_delrawaddr_cmd(lm->ifname, addr);
+    else
+        l4agctl_deladdr_cmd(lm->ifname, addr);
 }
 
 /*
@@ -585,25 +612,37 @@ int show_dev_defaultgw(char *dev)
 int main(int argc, char **argv)
 {
     struct nlinfo nli;
-    int err;
+    int err, rawsocket = 0;
 
-    /* support portnum */
-    if (argc < 3)
+    --argc; ++argv;
+    while (argc > 2 && (*argv)[0] == '-') {
+        if (strcmp(argv[0], "-r") == 0) {
+            printf("raw socket mode.\n");
+            rawsocket = 1;
+        } else {
+            break;
+        }
+        --argc; ++argv;
+    }
+
+    /* XXX should support portnum */
+    if (argc < 2)
         exit_with_usage();
 
     err = init_nlinfo(&nli);
     if (err < 0)
         return err;
 
-    strncpy(nli.lm.ifname, argv[1], IFNAMSIZ);
+    strncpy(nli.lm.ifname, argv[0], IFNAMSIZ);
     /* XXX should support hostname */
     nli.lm.paddr.sin_family = AF_INET;
-    nli.lm.paddr.sin_addr.s_addr = inet_addr(argv[2]);
+    nli.lm.paddr.sin_addr.s_addr = inet_addr(argv[1]);
     nli.lm.paddr.sin_port = htons(L4AG_DEFAULTPORT);
     nli.lm.active_devices = NULL;
+    nli.lm.rawsock = rawsocket;
     printf("if = %s, addr = %s\n", nli.lm.ifname,
            inet_ntoa(nli.lm.paddr.sin_addr));
-    argc -= 3; argv += 3;
+    argc -= 2; argv += 2;
     while (argc > 0) {
         int ifindex = getifindexbyname(*argv);
         if (ifindex >= 0) {

@@ -1017,6 +1017,7 @@ static struct l4conn *l4conn_create(struct l4ag_struct *ln, int flags)
     lc->recv_sock = NULL;
     lc->send_sock = NULL;
     lc->recv_thread = NULL;
+    memset(lc->dev, 0, sizeof(lc->dev));
     lc->private_data = NULL;
     DBG(KERN_INFO "l4ag: create l4conn struct.\n");
     return lc;
@@ -1820,11 +1821,18 @@ static void l4ag_release_ab(struct l4ag_struct *ln)
 #define L4CONN_PRI_IS_HIGH(lc1, lc2) \
     ((lc1)->pri != 0 && ((lc1)->pri < (lc2)->pri))
 
+/* prototype declaration */
+static void l4ag_rawab_change_l4conn(struct l4ag_struct *ln,
+                                     struct l4conn *oldlc,
+                                     struct l4conn *newlc);
+
 /* active/backup algorithm does not distinguish send/recv socket */
 static void l4ag_add_socket_ab(struct l4ag_struct *ln, struct l4conn *lc)
 {
     struct l4ag_ab_info *abinfo;
+    struct l4conn *oldlc;
     abinfo = (struct l4ag_ab_info *)lc->l4st->ops->private_data;
+    oldlc = abinfo->primary_lc;
 
     DBG(KERN_INFO "l4ag: active/backup: add socket.\n");
 
@@ -1837,19 +1845,24 @@ static void l4ag_add_socket_ab(struct l4ag_struct *ln, struct l4conn *lc)
         DBG(KERN_INFO "l4ag: active/backup: set new connection, pri = %d\n", lc->pri);
         abinfo->primary_lc = lc;
     }
+    if ((ln->flags & L4AG_RAWSOCKET) && (abinfo->primary_lc != oldlc))
+        l4ag_rawab_change_l4conn(ln, oldlc, abinfo->primary_lc);
 }
 
 static void l4ag_delete_socket_ab(struct l4ag_struct *ln, struct l4conn *lc)
 {
     struct l4ag_ab_info *abinfo;
-    struct l4conn *ptr, *primary = NULL;
+    struct l4conn *ptr, *primary = NULL, *oldlc;
 
     abinfo = (struct l4ag_ab_info *)lc->l4st->ops->private_data;
+    oldlc = abinfo->primary_lc;
 
     DBG(KERN_INFO "l4ag: active/backup: delete socket.\n");
 
     if (list_empty(&lc->l4st->l4conn_list)) {
         abinfo->primary_lc = NULL;
+        if (ln->flags & L4AG_RAWSOCKET)
+            l4ag_rawab_change_l4conn(ln, oldlc, NULL);
         return;
     }
 
@@ -1861,14 +1874,17 @@ static void l4ag_delete_socket_ab(struct l4ag_struct *ln, struct l4conn *lc)
             primary = ptr;
     }
     abinfo->primary_lc = primary;
+    if ((ln->flags & L4AG_RAWSOCKET) && (abinfo->primary_lc != oldlc))
+        l4ag_rawab_change_l4conn(ln, oldlc, abinfo->primary_lc);
 }
 
 static void l4ag_change_priority_ab(struct l4ag_struct *ln, struct l4conn *lc)
 {
     struct l4ag_ab_info *abinfo;
-    struct l4conn *ptr, *primary = NULL;
+    struct l4conn *ptr, *primary = NULL, *oldlc;
 
     abinfo = (struct l4ag_ab_info *)lc->l4st->ops->private_data;
+    oldlc = abinfo->primary_lc;
 
     DBG(KERN_INFO "l4ag: active/backup: change priority.\n");
 
@@ -1878,6 +1894,8 @@ static void l4ag_change_priority_ab(struct l4ag_struct *ln, struct l4conn *lc)
             primary = ptr;
     }
     abinfo->primary_lc = primary;
+    if ((ln->flags & L4AG_RAWSOCKET) && (abinfo->primary_lc != oldlc))
+        l4ag_rawab_change_l4conn(ln, oldlc, abinfo->primary_lc);
 }
 
 static int l4ag_recvpacket_ab(struct l4ag_struct *ln, struct l4conn *lc)
@@ -2288,6 +2306,60 @@ static struct l4ag_operations __attribute__((unused)) l4ag_rb_ops = {
 };
 
 /* active/backup recv/send operation for raw socket */
+
+/* This function does not work correctly. I can't find what's wrong... */
+static int l4ag_rawab_request_hostroute(struct l4conn *lc, int cmd)
+{
+    struct rtentry rt;
+    struct sockaddr_in *sin;
+    struct socket *sock;
+    unsigned int netmask = 0xffffffff;
+    int err;
+
+    memset(&rt, 0, sizeof(rt));
+    rt.rt_flags = RTF_UP | RTF_HOST;
+    sin = (struct sockaddr_in *)&rt.rt_dst;
+    sin->sin_family = AF_INET;
+    sin->sin_addr.s_addr = lc->dsin.sin_addr.s_addr;
+    sin = (struct sockaddr_in *)&rt.rt_genmask;
+    sin->sin_family = AF_INET;
+    sin->sin_addr.s_addr = netmask;
+    rt.rt_dev = lc->dev;
+
+    err = sock_create_kern(AF_INET, SOCK_DGRAM, 0, &sock);
+    if (err < 0) {
+        DBG(KERN_INFO "l4ag: Can't create socket.\n");
+        return err;
+    }
+    err = kernel_sock_ioctl(sock, cmd, (unsigned long)&rt);
+    if (err < 0) {
+        DBG(KERN_INFO "l4ag: ioctl failed for hostroute.\n");
+    }
+    sock_release(sock);
+    return err;
+}
+
+static inline int l4ag_rawab_add_hostroute(struct l4conn *lc)
+{
+    return l4ag_rawab_request_hostroute(lc, SIOCADDRT);
+}
+
+static inline int l4ag_rawab_delete_hostroute(struct l4conn *lc)
+{
+    return l4ag_rawab_request_hostroute(lc, SIOCDELRT);
+}
+
+static void l4ag_rawab_change_l4conn(struct l4ag_struct *ln,
+                                     struct l4conn *oldlc,
+                                     struct l4conn *newlc)
+{
+#if 0
+    if (oldlc)
+        l4ag_rawab_delete_hostroute(oldlc);
+    if (newlc)
+        l4ag_rawab_add_hostroute(newlc);
+#endif
+}
 
 static int l4ag_recvpacket_rawab(struct l4ag_struct *ln, struct l4conn *lc)
 {
@@ -3058,6 +3130,28 @@ static int l4ag_set_operation(struct net *net, struct file *file,
     return err;
 }
 
+static int l4ag_set_fromdev(struct net *net, struct file *file,
+                            struct ifreq *ifr)
+{
+    struct l4ag_net *lnet;
+    struct l4ag_struct *ln;
+    struct l4conn *lc;
+
+    lnet = net_generic(current->nsproxy->net_ns, l4ag_net_id);
+    ln = l4ag_get_by_name(lnet, ifr->ifr_name);
+    if (!ln)
+        return -EINVAL;
+
+    /* XXX assume first l4conn as the target for now. */
+    if (list_empty(&ln->l4conn_list))
+        return -EINVAL;
+
+    lc = list_first_entry(&ln->l4conn_list, struct l4conn, list);
+    strncpy(lc->dev, ifr->ifr_data, IFNAMSIZ);
+    DBG(KERN_INFO "l4ag: set device: %s\n", lc->dev);
+    return 0;
+}
+
 static int l4ag_fops_ioctl(struct inode *inode, struct file *file,
                       unsigned int cmd, unsigned long arg)
 {
@@ -3143,6 +3237,14 @@ static int l4ag_fops_ioctl(struct inode *inode, struct file *file,
         ifr.ifr_name[IFNAMSIZ-1] = '\0';
         rtnl_lock();
         err = l4ag_set_operation(current->nsproxy->net_ns, file, &ifr);
+        rtnl_unlock();
+        return err;
+    }
+
+    if (cmd == L4AGIOCSDEV) {
+        ifr.ifr_name[IFNAMSIZ-1] = '\0';
+        rtnl_lock();
+        err = l4ag_set_fromdev(current->nsproxy->net_ns, file, &ifr);
         rtnl_unlock();
         return err;
     }

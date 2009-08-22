@@ -247,6 +247,16 @@ int l4agctl_setpri_cmd(char *dev, int pri)
     return do_ioctl(L4AGIOCSPRI, &ifr);
 }
 
+int l4agctl_setdev_cmd(char *dev, char *fromdev)
+{
+    struct ifreq ifr;
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, dev, IFNAMSIZ);
+    ifr.ifr_data = fromdev;
+    return do_ioctl(L4AGIOCSDEV, &ifr);
+}
+
 int l4agctl_setpeer_cmd(char *dev, struct sockaddr_in *sin, char *fromdev)
 {
     struct ifreq ifr;

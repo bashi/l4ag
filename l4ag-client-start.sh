@@ -6,6 +6,7 @@ exit_with_usage() {
     echo "  -r addr        specify remote address of the tunnel"
     echo "  -a algorithm   specify recv/send algorithm"
     echo "  -t             set mulit-homed routing information before start"
+		echo "  -R             using Layer 3 tunnel"
 	exit 1
 }
 
@@ -25,6 +26,7 @@ PPPADDR_SERVER="192.168.30.1"
 PPPADDR_CLIENT="192.168.30.2"
 DO_ROUTING="no"
 ALGORITHM="actstby"  # default algorithm = active/backup
+RAWSOCKET="no"
 
 # add routing information
 do_iproute_ppp() {
@@ -62,7 +64,7 @@ do_iproute() {
 }
 
 # parse options
-while getopts a:l:r:t opt
+while getopts a:l:r:tR opt
 do
 	case ${opt} in
   a)
@@ -73,6 +75,8 @@ do
 		PPPADDR_REMOTE=${OPTARG};;
 	t)
 		DO_ROUTING="yes";;
+	R)
+	  RAWSOCKET="yes";;
 	esac
 done
 
@@ -97,11 +101,14 @@ if [ "$DO_ROUTING" = "yes" ]; then
 	done
 fi
 	
-# create l4ag device (assume devname = l4ag0)
-$E $L4CFG create l4ag0 || die
-
-# set algorithm involved
-$E $L4CFG algorithm l4ag0 $ALGORITHM || die
+if [ "$RAWSOCKET" = "yes" ]; then
+	$E $L4CFG create -r l4ag0 || die
+else
+	# create l4ag device (assume devname = l4ag0)
+	$E $L4CFG create l4ag0 || die
+	# set algorithm involved
+	$E $L4CFG algorithm l4ag0 $ALGORITHM || die
+fi
 
 # set p-to-p addresses
 $E ifconfig l4ag0 $PPPADDR_CLIENT pointopoint $PPPADDR_SERVER || die
@@ -115,11 +122,19 @@ for dev in "$@"; do
 	ppp) PRI=30;;
 	?) PRI=50;;
 	esac
-	$E $L4CFG peer -s "$dev" -P $PRI l4ag0 $SERVADDR
+	if [ "$RAWSOCKET" = "yes" ]; then
+		$E $L4CFG rawaddr -s "$dev" -P $PRI l4ag0 $SERVADDR
+	else
+		$E $L4CFG peer -s "$dev" -P $PRI l4ag0 $SERVADDR
+	fi
 done
 
 # launch l4agmond
-$E $L4MOND l4ag0 $SERVADDR $@
+if [ "$RAWSOCKET" = "yes" ]; then
+	$E $L4MOND -r l4ag0 $SERVADDR $@
+else
+	$E $L4MOND l4ag0 $SERVADDR $@
+fi
 
 # delete l4ag interface
 $E $L4CFG delete l4ag0

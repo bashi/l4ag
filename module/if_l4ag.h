@@ -36,7 +36,8 @@
 #define L4AGIOCRAWADDR  _IOW('L', 167, int)
 #define L4AGIOCRAWPEER  _IOW('L', 168, int)
 #define L4AGIOCRAWDELADDR   _IOW('L', 169, int)
-#define L4AGIOCSDEBUG _IOW('L', 170, int)
+#define L4AGIOCSDEV _IOW('L', 170, int)
+#define L4AGIOCSDEBUG _IOW('L', 180, int)
 
 /* Recv/Send operation types */
 enum {
@@ -148,6 +149,7 @@ struct l4conn {
     struct socket *send_sock;   // XXX should separate?
     struct sockaddr_in ssin;        /* source address, for raw socket */
     struct sockaddr_in dsin;        /* destination address, for raw socket */
+    char dev[IFNAMSIZ];
     void *private_data;
 };
 

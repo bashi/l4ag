@@ -22,6 +22,7 @@ int set_default_dev(char *dev);
 int l4agctl_createdevice_cmd(char *dev, int portnum, int rawsock);
 int l4agctl_deletedevice_cmd(char *dev);
 int l4agctl_setpri_cmd(char *dev, int pri);
+int l4agctl_setdev_cmd(char *dev, char *fromdev);
 int l4agctl_setpeer_cmd(char *dev, struct sockaddr_in *sin, char *fromdev);
 int l4agctl_deladdr_cmd(char *dev, struct in_addr *addr);
 int l4agctl_setrawaddr_cmd(char *dev, struct sockaddr_in *sin);

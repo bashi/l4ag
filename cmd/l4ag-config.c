@@ -140,6 +140,13 @@ int set_peer(int argc, char **argv)
     ret = l4agctl_setpeer_cmd(dev, &addr, fromdev);
     if (ret < 0)
         return ret;
+    if (fromdev) {
+        ret = l4agctl_setdev_cmd(dev, fromdev);
+        if (ret < 0) {
+            fprintf(stderr, "Can't set fromdev.\n");
+            return ret;
+        }
+    }
     if (priority > 0)
         ret = l4agctl_setpri_cmd(dev, priority);
     return ret;
@@ -224,6 +231,12 @@ int set_rawaddr(int argc, char **argv)
     ret = l4agctl_setrawpeer_cmd(dev, &dsin);
     if (ret < 0) {
         fprintf(stderr, "Can't set peer address for raw connection.\n");
+        l4agctl_delrawaddr_cmd(dev, &ssin.sin_addr);
+        return ret;
+    }
+    ret = l4agctl_setdev_cmd(dev, fromdev);
+    if (ret < 0) {
+        fprintf(stderr, "Can't set fromdev for raw connection.\n");
         l4agctl_delrawaddr_cmd(dev, &ssin.sin_addr);
         return ret;
     }
